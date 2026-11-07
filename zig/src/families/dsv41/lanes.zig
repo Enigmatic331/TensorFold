@@ -312,6 +312,9 @@ const Fill = struct {
     start: usize,
     replay: usize,
     last_end: usize,
+    image_next: usize = 0,
+    images_ready: bool,
+    images_set: bool,
     spans: std.ArrayList(@import("prompt.zig").Span),
     rows: std.ArrayList(u8),
 
@@ -466,6 +469,11 @@ pub const Lanes = struct {
         return std.mem.eql(u8, std.mem.span(v), "1");
     }
 
+    /// A tower image is a prompt boundary when yielding is enabled; cached and precomputed rows are not.
+    fn imageYieldBoundary(tower: bool, enabled: bool) bool {
+        return tower and enabled;
+    }
+
     /// TF_DS_DRAFT_ROW_MS=d: A3, the shared rounds' draft rows priced at d ms each apart from the streams' rows (the
     /// round table at the streams' count): the lane profiles of 2026-10-25 measured ~2.6-3.1 ms a draft row against
     /// ~4.4 ms a stream's row at c1-c2. Unset or 0: the table at the round's total rows, as served.
@@ -578,12 +586,15 @@ pub const Lanes = struct {
         }
     }
 
-    /// Placement, image encoding and a cached restore happen once, before this prompt's first chunk.
+    /// Placement and a cached restore happen once, before this prompt's image and text steps.
     fn startFill(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
         const gpa = self.gpa;
         m.joinAhead();
         m.fill_seq = &.{};
+        if (self.filling_slot) |old| {
+            if (self.fills[old]) |*f| f.images_set = false;
+        }
         self.filling_slot = null; // a failed setup must not leave another prompt's slot falsely selected
         const ids = s.prompt();
         const len = ids.len;
@@ -636,34 +647,20 @@ pub const Lanes = struct {
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
-        // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
-        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
+        // Image positions are dead in the sequence: no Engram n-gram reaches into or across one. The rows themselves
+        // are produced one tower image per prompt step after the kept state has been restored.
         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
         errdefer spans.deinit(gpa);
         var rows: std.ArrayList(u8) = .empty;
         errdefer rows.deinit(gpa);
         if (s.images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
-            const row_bytes = m.cfg.hidden * 2;
-            var at_row: usize = 0;
             for (s.images) |img| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
-                // The keyed snapshot already contains these image rows; only a span crossing its cut needs encoding.
-                if (kept) |sn| if (@as(usize, img.at) + img.tokens <= sn.at) continue;
-                if (img.rows) {
-                    if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
-                    try rows.appendSlice(gpa, img.bytes);
-                } else {
-                    // a prepared picture (vision.zig): the tower's span rows, here on rank 0
-                    const v = self.vision orelse return error.NoVisionTower;
-                    if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
-                }
-                try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
-                at_row += img.tokens;
             }
         }
         if (try self.begin(.fill_begin)) {
@@ -694,16 +691,55 @@ pub const Lanes = struct {
             .start = start,
             .replay = replay,
             .last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows,
+            .images_ready = s.images.len == 0,
+            .images_set = s.images.len == 0,
             .spans = spans,
             .rows = rows,
         };
         self.filling_slot = slot;
     }
 
+    /// Produce rows to one tower-image boundary; with a live reply, the host decodes before the next image.
+    fn fillImageStep(self: *Lanes, s: *lanes.Stream, slot: usize) !bool {
+        const gpa = self.gpa;
+        const m = self.m;
+        const f = &self.fills[slot].?;
+        if (f.images_ready) return true;
+        const row_bytes = m.cfg.hidden * 2;
+        while (f.image_next < s.images.len) {
+            if (s.isCancelled()) return error.Cancelled;
+            const img = s.images[f.image_next];
+            f.image_next += 1;
+            // A keyed snapshot already contains image rows wholly before its cut.
+            if (@as(usize, img.at) + img.tokens <= s.cached) continue;
+            const at_row = f.rows.items.len / row_bytes;
+            const tower = !img.rows;
+            if (img.rows) {
+                if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                try f.rows.appendSlice(gpa, img.bytes);
+            } else {
+                const v = self.vision orelse return error.NoVisionTower;
+                if (try v.rows(img.bytes, gpa, &f.rows) != img.tokens) return error.BadImageSpan;
+            }
+            try f.spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+            if (s.isCancelled()) return error.Cancelled;
+            if (imageYieldBoundary(tower, yieldOn())) return false;
+        }
+        f.images_ready = true;
+        if (self.filling_slot == slot) {
+            try self.fillImages(f.spans.items, f.rows.items);
+            f.images_set = true;
+        }
+        return true;
+    }
+
     /// Select a partially filled slot on every rank, without resending its full prompt or re-encoding its images.
     fn selectFill(self: *Lanes, slot: usize, base: usize) !void {
         const m = self.m;
         if (self.filling_slot != slot) {
+            if (self.filling_slot) |old| {
+                if (self.fills[old]) |*f| f.images_set = false;
+            }
             self.filling_slot = null;
             m.joinAhead();
             m.fill_seq = &.{};
@@ -714,8 +750,16 @@ pub const Lanes = struct {
             }
             try m.fillBegin(slot, base);
             const f = &self.fills[slot].?;
-            try self.fillImages(f.spans.items, f.rows.items);
+            if (f.images_ready) {
+                try self.fillImages(f.spans.items, f.rows.items);
+                f.images_set = true;
+            }
             self.filling_slot = slot;
+        }
+        const f = &self.fills[slot].?;
+        if (f.images_ready and !f.images_set) {
+            try self.fillImages(f.spans.items, f.rows.items);
+            f.images_set = true;
         }
         m.fill_seq = self.seqs[slot].items;
     }
@@ -736,6 +780,7 @@ pub const Lanes = struct {
         if (s.isCancelled()) return error.Cancelled;
         if (!self.streams.contains(s)) try self.startFill(s);
         const lane = self.streams.get(s).?;
+        if (!try self.fillImageStep(s, lane.slot)) return false;
         try self.selectFill(lane.slot, lane.base);
         const f = &self.fills[lane.slot].?;
         const seq = &self.seqs[lane.slot];
@@ -1388,6 +1433,12 @@ test "a frame's fields read back as written" {
     try r.ids(gpa, &got);
     try std.testing.expectEqualSlices(i32, &.{ 1, -2, 129279 }, got.items);
     try std.testing.expectError(error.ShortFrame, r.int(u8));
+}
+
+test "only a tower image reaches a yield boundary" {
+    try std.testing.expect(!Lanes.imageYieldBoundary(true, false));
+    try std.testing.expect(!Lanes.imageYieldBoundary(false, true));
+    try std.testing.expect(Lanes.imageYieldBoundary(true, true));
 }
 
 test "a round's rows: each window at its positions, its ids written over the rejected rows" {
