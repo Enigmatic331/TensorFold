@@ -38,7 +38,15 @@ pub const Ids = struct {
     }
 };
 
+/// The checkpoint's weight format: exl3, an EXL3 quant (mul1); native, DeepSeek's own release (FP8 E4M3 linears with
+/// UE8M0 scales on 32 x 32 blocks, MXFP4 routed experts, bf16 elsewhere), served by native.zig.
+pub const Format = enum { exl3, native };
+
 pub const Config = struct {
+    format: Format = .exl3,
+    /// Format.native with NVIDIA's NVFP4 routed experts (nvidia/DeepSeek-V4.1-Flash-1017-NVFP4: moe_quant_algo NVFP4):
+    /// the target layers' routed experts in NVFP4 W4A4; the DSpark stages and everything else as DeepSeek's release.
+    nvfp4: bool = false,
     layers: usize,
     draft_layers: usize,
     hidden: usize,
@@ -158,12 +166,14 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, why: *Why) !Config {
         why.set("config.json's model_type is {f}, not deepseek_v41", .{std.json.fmt(mt, .{})});
         return error.NotDeepSeekV41;
     }
-    try quantization(top, why);
+    const format = try quantization(top, why);
     const o = if (top.get("text_config")) |t| (if (t == .object) t.object else top) else top;
     const rope_v = try field(o, "rope_scaling");
     if (rope_v != .object) return error.BadConfig;
     const rope = rope_v.object;
     var c = Config{
+        .format = format,
+        .nvfp4 = moeNvfp4(top),
         .layers = try int(o, "num_hidden_layers"),
         .draft_layers = try int(o, "num_nextn_predict_layers"),
         .hidden = try int(o, "hidden_size"),
@@ -240,15 +250,40 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, why: *Why) !Config {
     return c;
 }
 
-/// The EXL3 checkpoint our kernels read: quant_method exl3, the mul1 codebook.
-fn quantization(top: std.json.ObjectMap, why: *Why) !void {
+/// quantization_config.moe_quant_algo says the routed experts are NVFP4.
+fn moeNvfp4(top: std.json.ObjectMap) bool {
+    const q = top.get("quantization_config") orelse return false;
+    if (q != .object) return false;
+    const m = q.object.get("moe_quant_algo") orelse return false;
+    return m == .string and std.mem.eql(u8, m.string, "NVFP4");
+}
+
+/// The checkpoints our kernels read: an EXL3 quant (quant_method exl3, the mul1 codebook), or DeepSeek's own release
+/// (quant_method fp8, 32 x 32 weight blocks, ue8m0 scales, fp4 experts).
+fn quantization(top: std.json.ObjectMap, why: *Why) !Format {
     const q = top.get("quantization_config") orelse {
-        why.set("config.json declares no quantization_config; the native DeepSeek-V4.1 kernels read EXL3 checkpoints", .{});
+        why.set("config.json declares no quantization_config; the DeepSeek-V4.1 kernels read EXL3 or DeepSeek's FP8 / FP4 checkpoints", .{});
         return error.UnsupportedQuantization;
     };
     const m = if (q == .object) q.object.get("quant_method") else null;
+    if (m != null and m.? == .string and std.mem.eql(u8, m.?.string, "fp8")) {
+        const o = q.object;
+        const blk = o.get("weight_block_size");
+        const blk_ok = blk != null and blk.? == .array and blk.?.array.items.len == 2 and
+            blk.?.array.items[0] == .integer and blk.?.array.items[0].integer == 32 and
+            blk.?.array.items[1] == .integer and blk.?.array.items[1].integer == 32;
+        const fmt = o.get("scale_fmt");
+        const fmt_ok = fmt != null and fmt.? == .string and std.mem.eql(u8, fmt.?.string, "ue8m0");
+        const ed = o.get("expert_dtype");
+        const ed_ok = ed != null and ed.? == .string and std.mem.eql(u8, ed.?.string, "fp4");
+        if (!blk_ok or !fmt_ok or !ed_ok) {
+            why.set("config.json's fp8 quantization is not DeepSeek-V4.1's (32 x 32 blocks, ue8m0 scales, fp4 experts)", .{});
+            return error.UnsupportedQuantization;
+        }
+        return .native;
+    }
     if (m == null or m.? != .string or !std.mem.eql(u8, m.?.string, "exl3")) {
-        why.set("config.json's quant_method is not exl3; the native DeepSeek-V4.1 kernels read EXL3 checkpoints", .{});
+        why.set("config.json's quant_method is neither exl3 nor fp8; the DeepSeek-V4.1 kernels read EXL3 or DeepSeek's FP8 / FP4 checkpoints", .{});
         return error.UnsupportedQuantization;
     }
     const cb = q.object.get("codebook");
@@ -256,6 +291,7 @@ fn quantization(top: std.json.ObjectMap, why: *Why) !void {
         why.set("config.json's EXL3 codebook is not mul1; the served kernels were built for mul1", .{});
         return error.UnsupportedQuantization;
     }
+    return .exl3;
 }
 
 /// The shapes the served kernels and our TP2 split (DESIGN.md section 2) are built for.
@@ -319,13 +355,31 @@ test "refuse other model types, other quantization and other shapes" {
     try std.testing.expectError(error.NotDeepSeekV41, parse(a, other, &why));
     const fp8 = try std.mem.replaceOwned(u8, a, test_config, "\"quant_method\": \"exl3\"", "\"quant_method\": \"fp8\"");
     defer a.free(fp8);
-    try std.testing.expectError(error.UnsupportedQuantization, parse(a, fp8, &why));
+    try std.testing.expectError(error.UnsupportedQuantization, parse(a, fp8, &why)); // fp8 without DeepSeek's blocks
+    const int8 = try std.mem.replaceOwned(u8, a, test_config, "\"quant_method\": \"exl3\"", "\"quant_method\": \"int8\"");
+    defer a.free(int8);
+    try std.testing.expectError(error.UnsupportedQuantization, parse(a, int8, &why));
     const mcg = try std.mem.replaceOwned(u8, a, test_config, "\"mul1\"", "\"mcg\"");
     defer a.free(mcg);
     try std.testing.expectError(error.UnsupportedQuantization, parse(a, mcg, &why));
     const wide = try std.mem.replaceOwned(u8, a, test_config, "\"num_experts_per_tok\": 6", "\"num_experts_per_tok\": 8");
     defer a.free(wide);
     try std.testing.expectError(error.UnsupportedShapes, checkShapes(try parse(a, wide, &why), &why));
+}
+
+test "DeepSeek's own release (FP8 linears, FP4 experts) parses as the native format" {
+    const a = std.testing.allocator;
+    var why: Why = .{};
+    const native = try std.mem.replaceOwned(u8, a, test_config, "{\"quant_method\": \"exl3\", \"codebook\": \"mul1\"}",
+        "{\"quant_method\": \"fp8\", \"activation_scheme\": \"dynamic\", \"weight_block_size\": [32, 32], \"scale_fmt\": \"ue8m0\", \"expert_dtype\": \"fp4\"}");
+    defer a.free(native);
+    const c = try parse(a, native, &why);
+    try checkShapes(c, &why);
+    try std.testing.expectEqual(Format.native, c.format);
+    try std.testing.expectEqual(Format.exl3, (try parse(a, test_config, &why)).format);
+    const blk128 = try std.mem.replaceOwned(u8, a, native, "[32, 32]", "[128, 128]");
+    defer a.free(blk128);
+    try std.testing.expectError(error.UnsupportedQuantization, parse(a, blk128, &why));
 }
 
 test "a refusal's reason is cut at the buffer, never past it" {

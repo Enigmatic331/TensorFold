@@ -32,6 +32,127 @@ fn find(text: []const u8, tag: []const u8) ?usize {
     return findTag(text, 0, tag);
 }
 
+/// The invoke and parameter tags of a DSML spelling, by its block's opener (null: not a DSML block). V4's parser
+/// requires a parameter's ``string`` attribute; V4.1's reads one when it is there.
+const Dsml = struct { invoke_open: []const u8, invoke_close: []const u8, param_open: []const u8, param_close: []const u8, attr_required: bool };
+
+fn dsmlTags(opener: []const u8) ?Dsml {
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    if (std.mem.eql(u8, opener, "<" ++ D ++ " calls>")) return .{ .invoke_open = "<" ++ D ++ " invoke name=\"", .invoke_close = "</" ++ D ++ " invoke>", .param_open = "<" ++ D ++ " parameter name=\"", .param_close = "</" ++ D ++ " parameter>", .attr_required = false };
+    if (std.mem.eql(u8, opener, "<" ++ D ++ "tool_calls>")) return .{ .invoke_open = "<" ++ D ++ "invoke name=\"", .invoke_close = "</" ++ D ++ "invoke>", .param_open = "<" ++ D ++ "parameter name=\"", .param_close = "</" ++ D ++ "parameter>", .attr_required = true };
+    return null;
+}
+
+/// Whether every ``closer`` in an invoke's ``body`` lies inside a parameter value, as the parser reads values: from
+/// the ``>`` after a parameter's name (and ``string`` attribute) to the first parameter closer after it.
+fn closersInValues(body: []const u8, closer: []const u8, t: Dsml) bool {
+    var c = findTag(body, 0, closer);
+    var p: usize = 0;
+    while (c) |at| {
+        const ps = findTag(body, p, t.param_open) orelse return false;
+        p = ps + 1;
+        const ns = ps + t.param_open.len;
+        const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
+        if (!t.attr_required and nq == ns) continue;
+        var v = nq + 1;
+        if (std.mem.startsWith(u8, body[v..], " string=\"true\"")) {
+            v += " string=\"true\"".len;
+        } else if (std.mem.startsWith(u8, body[v..], " string=\"false\"")) {
+            v += " string=\"false\"".len;
+        } else if (t.attr_required) continue;
+        if (v >= body.len or body[v] != '>') continue;
+        v += 1;
+        const pe = findTag(body, v, t.param_close) orelse continue;
+        if (at < v) return false; // a closer before this value, outside any value
+        var next: ?usize = at;
+        while (next) |n| {
+            if (n >= pe) break;
+            next = findTag(body, n + closer.len, closer);
+        }
+        c = next;
+        p = pe + t.param_close.len;
+    }
+    return true;
+}
+
+/// Whether ``rest`` is a proper start of ``tag``: the tag may still be being written.
+fn begins(rest: []const u8, tag: []const u8) bool {
+    return rest.len < tag.len and std.mem.startsWith(u8, tag, rest);
+}
+
+const Walk = union(enum) { closer: usize, more, broken };
+
+/// Reads a DSML block from ``from`` (just past its opener) the way the parser reads it: invokes, each a name up to the
+/// first quote followed by ``">``, each running to the first invoke closer after it, with only whitespace between them.
+/// The block's closer is the first one met between invokes, so a closer or an opener inside a parameter value (a file
+/// about DSML) neither ends nor splits the block. ``more``: the text ends inside the block; ``broken``: something else
+/// appears, a name holds a tag, or an invoke holds the block's closer outside its values.
+fn walkDsml(text: []const u8, from: usize, t: Dsml, closer: []const u8) Walk {
+    var p = from;
+    while (true) {
+        while (p < text.len and isSpaceByte(text[p])) p += 1;
+        if (p >= text.len) return .more;
+        const rest = text[p..];
+        if (std.mem.startsWith(u8, rest, closer)) return .{ .closer = p };
+        if (!std.mem.startsWith(u8, rest, t.invoke_open)) return if (begins(rest, closer) or begins(rest, t.invoke_open)) .more else .broken;
+        const ns = p + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, text, ns, '"') orelse
+            return if (std.mem.indexOfScalar(u8, text[ns..], '<') != null) .broken else .more;
+        if (std.mem.indexOfScalar(u8, text[ns..q], '<') != null) return .broken;
+        if (q + 2 > text.len) return .more;
+        if (!std.mem.startsWith(u8, text[q..], "\">")) return .broken;
+        const e = findTag(text, q + 2, t.invoke_close) orelse return .more;
+        // the invoke may hold the block's closer only inside its parameter values (a file about DSML)
+        if (!closersInValues(text[q + 2 .. e], closer, t)) return .broken;
+        p = e + t.invoke_close.len;
+    }
+}
+
+/// How many invokes in ``region`` the parser reads whole: a name up to its quote, then ``">``, then the first invoke
+/// closer after it (``dsml41Calls``' reading, which skips any invoke that does not complete).
+fn wholeInvokes(region: []const u8, t: Dsml) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (findTag(region, pos, t.invoke_open)) |s| {
+        pos = s + 1;
+        const ns = s + t.invoke_open.len;
+        const q = std.mem.indexOfScalarPos(u8, region, ns, '"') orelse continue;
+        if (q == ns or !std.mem.startsWith(u8, region[q..], "\">")) continue;
+        const e = findTag(region, q + 2, t.invoke_close) orelse continue;
+        pos = e + t.invoke_close.len;
+        n += 1;
+    }
+    return n;
+}
+
+/// Where the call block opened before ``from`` closes: the index of its closer, or null while it may still close. A
+/// DSML block's string values are not escaped, so a value can hold the block's own closer (a file about DSML). A block
+/// that reads as the parser reads it (``walkDsml``) closes at the first closer between its invokes, not at one inside
+/// an invoke, but only when that reading gives the parser more whole invokes than the first-closer rule gives over the
+/// same text (that block and the blocks it would have been split into): otherwise, and in every other case (a block
+/// that does not read that way, a reply that ended inside one, Qwen's and Gemma's markup), the first closer closes it.
+/// While the reply streams, a DSML block still being written stays hidden.
+pub fn blockEnd(text: []const u8, from: usize, opener: []const u8, closer: []const u8, finished: bool) ?usize {
+    const first = findTag(text, from, closer);
+    const t = dsmlTags(opener) orelse return first;
+    switch (walkDsml(text, from, t, closer)) {
+        .closer => |at| {
+            if (first == null or at == first.?) return at;
+            // the first-closer rule over the same text: the block to the first closer, then each block it opens after it
+            var split = wholeInvokes(text[from..first.?], t);
+            var pos = first.? + closer.len;
+            while (findTag(text[0..at], pos, opener)) |o| {
+                const e = findTag(text, o + opener.len, closer) orelse break;
+                split += wholeInvokes(text[o + opener.len .. e], t);
+                pos = e + closer.len;
+            }
+            return if (wholeInvokes(text[from..at], t) > split) at else first;
+        },
+        .more => return if (finished) first else null,
+        .broken => return first,
+    }
+}
+
 pub fn isChannel(m: Markers) bool {
     return std.mem.eql(u8, m.close, channel_markers.close);
 }
@@ -125,7 +246,7 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
         }
         try out.appendSlice(a, text[pos..start.?]);
         const opener = calls[which][0];
-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
+        const end = blockEnd(text, start.? + opener.len, opener, calls[which][1], finished) orelse return out.items;
         pos = end + calls[which][1].len;
     }
 }

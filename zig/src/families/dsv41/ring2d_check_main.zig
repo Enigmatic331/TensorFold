@@ -35,12 +35,16 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
-    const g = try std.fmt.parseInt(u32, args[1], 10);
+    // RANK: the NCCL rank (rank 0 listens); the node it checks is TF_DS_2D_ORDER's (unset: the rank)
+    const nccl_rank = try std.fmt.parseInt(u32, args[1], 10);
+    if (nccl_rank >= 4) return error.BadRank;
+    const ord = try dsv41.prompt2d.order();
+    const g = ord[nccl_rank];
     const ip = try dsv41.link.parseIp(args[2]);
     const port = try std.fmt.parseInt(u16, args[3], 10);
     var rows_text: []const u8 = "1,6,16,32,48";
     var reps: usize = 200;
-    var gid: u8 = 5;
+    var gid: ?u8 = null;
     var i: usize = 6;
     while (i + 1 < args.len) : (i += 2) {
         if (std.mem.eql(u8, args[i], "--rows")) rows_text = args[i + 1] else if (std.mem.eql(u8, args[i], "--reps")) reps = try std.fmt.parseInt(usize, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--gid")) gid = try std.fmt.parseInt(u8, args[i + 1], 10) else return error.BadArgument;
@@ -66,11 +70,11 @@ pub fn main(init: std.process.Init) !u8 {
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
 
-    var fan = try dsv41.prompt2d.Fan.open(io, ip, port, g, 4);
+    var fan = try dsv41.prompt2d.Fan.open(io, ip, port, nccl_rank, 4);
     defer fan.close();
-    var comm = try fan.comm(g, 4);
+    var comm = try fan.comm(nccl_rank, 4);
     defer comm.deinit();
-    var rings = try ring2d.Rings.open(gpa, &driver, try rdma.Kernels.load(module), devices.items, g, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);
+    var rings = try ring2d.Rings.open(gpa, &driver, try rdma.Kernels.load(module), devices.items, g, ord, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);
     defer rings.close(gpa);
 
     var all_ok = true;

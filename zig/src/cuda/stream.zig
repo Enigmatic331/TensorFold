@@ -36,6 +36,12 @@ pub const Stream = struct {
     pub fn wait(self: Stream, event: Event) Error!void {
         try self.d.check(self.d.api.cuStreamWaitEvent(self.handle, event.handle, 0), "cuStreamWaitEvent");
     }
+
+    /// `f(data)` on a driver thread once the work queued before it is done; the work queued after it waits for its
+    /// return. `f` makes no CUDA call.
+    pub fn hostFunc(self: Stream, f: abi.HostFn, data: ?*anyopaque) Error!void {
+        try self.d.check(self.d.api.cuLaunchHostFunc(self.handle, f, data), "cuLaunchHostFunc");
+    }
 };
 
 pub const Event = struct {

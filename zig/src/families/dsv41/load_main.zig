@@ -1,10 +1,11 @@
-//! tf-dsv41-load MODEL_DIR RANK WORLD [--cache DIR] [--digests OUT.jsonl]: one rank's weights onto its GPU through the
-//! Zig loader (from the lane's rank cache, else the checkpoint), timed, with each device tensor's sha256 read back.
+//! tf-dsv41-load MODEL_DIR RANK WORLD [--cache DIR] [--digests OUT.jsonl] [--parity]: one rank's weights onto its GPU
+//! through the Zig loader (from the lane's rank cache, else the checkpoint), timed, with each device tensor's sha256 read
+//! back. WORLD 4 is the 2D split (node RANK = TP2 rank RANK % 2 of pair RANK / 2), --parity its balanced experts split.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 
-const usage = "usage: tf-dsv41-load MODEL_DIR RANK WORLD [--cache DIR] [--digests OUT.jsonl] [--no-dspark]\n";
+const usage = "usage: tf-dsv41-load MODEL_DIR RANK WORLD [--cache DIR] [--digests OUT.jsonl] [--no-dspark] [--parity]\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
@@ -19,6 +20,7 @@ pub fn main(init: std.process.Init) !u8 {
     var cache_dir: ?[]const u8 = null;
     var digests: ?[]const u8 = null;
     var dspark = true;
+    var parity = false;
     var i: usize = 4;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--cache") and i + 1 < args.len) {
@@ -27,9 +29,13 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, args[i], "--digests") and i + 1 < args.len) {
             digests = args[i + 1];
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--no-dspark")) dspark = false;
+        } else if (std.mem.eql(u8, args[i], "--no-dspark")) {
+            dspark = false;
+        } else if (std.mem.eql(u8, args[i], "--parity")) parity = true;
     }
     const cfg = try dsv41.Config.read(a, io, args[1]);
+    var split = try dsv41.prompt2d.split(rank, world);
+    split.parity = split.pair != null and parity;
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
@@ -43,11 +49,11 @@ pub fn main(init: std.process.Init) !u8 {
         defer ix.deinit();
         var file = try dir.openFile(io, name, .{});
         defer file.close(io);
-        break :blk try dsv41.weights.load(init.gpa, &driver, .{ .cache = .{ .file = file, .index = &ix, .io = io } }, cfg, .{ .rank = rank, .world = world }, dspark);
+        break :blk try dsv41.weights.load(init.gpa, &driver, .{ .cache = .{ .file = file, .index = &ix, .io = io } }, cfg, split, dspark);
     } else blk: {
         var sh = try dsv41.checkpoint.Shards.open(init.gpa, io, args[1]);
         defer sh.close(io);
-        break :blk try dsv41.weights.load(init.gpa, &driver, .{ .shards = &sh }, cfg, .{ .rank = rank, .world = world }, dspark);
+        break :blk try dsv41.weights.load(init.gpa, &driver, .{ .shards = &sh }, cfg, split, dspark);
     };
     defer w.deinit();
     const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;

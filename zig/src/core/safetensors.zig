@@ -17,10 +17,12 @@ pub const DType = enum {
     u64,
     i64,
     f64,
+    f8_e4m3, // FP8 E4M3 (DeepSeek's FP8 weights and Engram tables)
+    f8_e8m0, // UE8M0 power-of-two scales
 
     pub fn size(self: DType) usize {
         return switch (self) {
-            .bool, .u8, .i8 => 1,
+            .bool, .u8, .i8, .f8_e4m3, .f8_e8m0 => 1,
             .u16, .i16, .f16, .bf16 => 2,
             .u32, .i32, .f32 => 4,
             .u64, .i64, .f64 => 8,
@@ -28,7 +30,7 @@ pub const DType = enum {
     }
 
     pub fn parse(text: []const u8) ?DType {
-        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 } };
+        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E8M0", .f8_e8m0 } };
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
     }

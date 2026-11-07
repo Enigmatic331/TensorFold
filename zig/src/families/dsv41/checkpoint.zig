@@ -1,5 +1,7 @@
 //! The checkpoint's tensors as the split takes them, by the loader's keys (plan.zig): whole, by input rows or by
 //! output columns, in the dtypes the Python loader keeps, so each entry's bytes equal the lane's rank cache entry.
+//! DeepSeek's own release (Format.native) is read the same way through native parts (plan.Native): weights and their
+//! UE8M0 scales sliced on the scale blocks, bf16 weights by rows and columns.
 const std = @import("std");
 const core = @import("core");
 const st = core.safetensors;
@@ -74,6 +76,15 @@ const Key = struct {
     rows: ?[2]usize = null,
     part: []const u8 = "",
 
+    /// A native part ("w8", "s8", "w4", "s4", "t4", "bf"), else null (an EXL3 part).
+    fn native(k: Key) ?NativePart {
+        if (!k.exl3) return null;
+        inline for (.{ .{ "w8", NativePart.w8 }, .{ "s8", NativePart.s8 }, .{ "w4", NativePart.w4 }, .{ "s4", NativePart.s4 }, .{ "t4", NativePart.t4 }, .{ "bf", NativePart.bf } }) |x| {
+            if (std.mem.eql(u8, k.part, x[0])) return x[1];
+        }
+        return null;
+    }
+
     fn parse(key: []const u8) !Key {
         var f: [4][]const u8 = undefined;
         var n: usize = 0;
@@ -110,15 +121,44 @@ fn dtypeOf(d: st.DType) !DType {
         .i16 => .i16,
         .i32 => .i32,
         .i64 => .i64,
-        .u8 => .u8,
+        .u8, .i8, .f8_e4m3, .f8_e8m0 => .u8, // bytes: FP8 / FP4 codes and UE8M0 scales, kept as stored
         else => error.UnsupportedDType,
     };
 }
 
+/// A native part's tensor (".weight" or ".scale") and how a [N, K] slice maps onto it: dim 0 holds N / d0 rows (one
+/// a scale block for FP8 scales), dim 1 holds K / d1 values (two FP4 codes a byte, one scale a block of 32).
+const NativePart = enum {
+    w8,
+    s8,
+    w4,
+    s4,
+    t4, // NVFP4's weight_scale: E4M3 per 16 values, stored equal in pairs, read as one a block of 32
+    bf,
+
+    fn tensor(p: NativePart) []const u8 {
+        return switch (p) {
+            .w8, .w4, .bf => "weight",
+            .s8, .s4 => "scale",
+            .t4 => "weight_scale",
+        };
+    }
+
+    /// (dim 0's divisor of N, dim 1's divisor of K)
+    fn div(p: NativePart) [2]usize {
+        return switch (p) {
+            .w8, .bf => .{ 1, 1 },
+            .s8 => .{ 32, 32 },
+            .w4 => .{ 1, 2 },
+            .s4, .t4 => .{ 1, 32 },
+        };
+    }
+};
+
 const Source = struct { t: st.Tensor, name: []const u8 };
 
 fn source(sh: *const Shards, k: Key, buf: []u8) !Source {
-    const name = if (!k.exl3) k.name else blk: {
+    const name = if (!k.exl3) k.name else if (k.native()) |np| try std.fmt.bufPrint(buf, "{s}.{s}", .{ k.name, np.tensor() }) else blk: {
         const tail = if (std.mem.eql(u8, k.part, "tr")) "trellis" else if (std.mem.eql(u8, k.part, "suh")) "suh" else if (std.mem.eql(u8, k.part, "svh")) "svh" else return error.BadKey;
         break :blk try std.fmt.bufPrint(buf, "{s}.{s}", .{ k.name, tail });
     };
@@ -132,7 +172,18 @@ pub fn describe(sh: *const Shards, key: []const u8) !Slice {
     const s = try source(sh, k, &buf);
     var out: Slice = .{ .dtype = try dtypeOf(s.t.dtype), .rank = s.t.rank, .shape = s.t.shape, .bytes = 0 };
     if (k.dtype) |d| out.dtype = d;
-    if (k.exl3) {
+    if (k.native()) |np| {
+        if (s.t.rank != 2) return error.UnexpectedTensor;
+        const dv = np.div();
+        if (k.cols) |c| {
+            if (c[0] % dv[0] != 0 or c[1] % dv[0] != 0) return error.UnalignedSlice;
+            out.shape[0] = (c[1] - c[0]) / dv[0];
+        }
+        if (k.rows) |r| {
+            if (r[0] % dv[1] != 0 or r[1] % dv[1] != 0) return error.UnalignedSlice;
+            out.shape[1] = (r[1] - r[0]) / dv[1];
+        } else if (np == .t4) out.shape[1] /= 2;
+    } else if (k.exl3) {
         if (std.mem.eql(u8, k.part, "tr")) {
             if (k.rows) |r| out.shape[0] = (r[1] - r[0]) / 16;
             if (k.cols) |c| out.shape[1] = (c[1] - c[0]) / 16;
@@ -179,7 +230,29 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
         const from = try dtypeOf(t.dtype);
         if (k.dtype == null or k.dtype.? == from) return @memcpy(out, t.bytes);
         if (from == .f16 and k.dtype.? == .f32) return widenHalf(t.bytes, out);
+        if (from == .bf16 and k.dtype.? == .f32) return widenBf16(t.bytes, out);
         return error.UnsupportedConversion;
+    }
+    if (k.native()) |np| {
+        // rows [c0, c1) of dim 0, columns [r0, r1) of dim 1, in the part's units
+        const dv = np.div();
+        const es = (try dtypeOf(t.dtype)).size();
+        const row = t.dim(1) * es;
+        const r0 = if (k.cols) |c| c[0] / dv[0] else 0;
+        const nr = want.shape[0];
+        const c0 = (if (k.rows) |r| r[0] / dv[1] else 0) * es;
+        const w = want.shape[1] * es;
+        if (np == .t4) {
+            // the pairs of per-16 scales, each one byte per 32; a pair that differs is not this kernel's checkpoint
+            for (0..nr) |i| for (0..w) |j| {
+                const pair = t.bytes[(r0 + i) * row + 2 * (c0 + j) ..][0..2];
+                if (pair[0] != pair[1]) return error.UnequalScalePair;
+                out[i * w + j] = pair[0];
+            };
+            return;
+        }
+        for (0..nr) |i| @memcpy(out[i * w ..][0..w], t.bytes[(r0 + i) * row + c0 ..][0..w]);
+        return;
     }
     const es = (try dtypeOf(t.dtype)).size();
     if (std.mem.eql(u8, k.part, "tr")) {
@@ -201,6 +274,15 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
     @memcpy(out, t.bytes);
 }
 
+/// bf16 -> f32, exact (the high half of the f32 bits).
+fn widenBf16(src: []const u8, out: []u8) void {
+    const n = src.len / 2;
+    for (0..n) |i| {
+        const b: u32 = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
+        std.mem.writeInt(u32, out[4 * i ..][0..4], b << 16, .little);
+    }
+}
+
 /// f16 -> f32, exact (the loader's .to(torch.float32) of an f16 tensor).
 fn widenHalf(src: []const u8, out: []u8) void {
     const n = src.len / 2;
@@ -208,6 +290,55 @@ fn widenHalf(src: []const u8, out: []u8) void {
         const h: f16 = @bitCast(std.mem.readInt(u16, src[2 * i ..][0..2], .little));
         std.mem.writeInt(u32, out[4 * i ..][0..4], @bitCast(@as(f32, h)), .little);
     }
+}
+
+test "native parts: FP8 weights and their 32 x 32 block scales, FP4 codes and their row scales, by rows and columns" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // w8 [64, 64] F8_E4M3, s8 [2, 2] F8_E8M0, w4 [64, 32] I8 (K 64), s4 [64, 2] F8_E8M0, g [4, 2] BF16
+    var body: [4096 + 4 + 2048 + 128 + 16]u8 = undefined;
+    for (&body, 0..) |*x, i| x.* = @truncate(i *% 7 +% i / 256);
+    const json = "{\"a.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[64,64],\"data_offsets\":[0,4096]}," ++
+        "\"a.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[2,2],\"data_offsets\":[4096,4100]}," ++
+        "\"b.weight\":{\"dtype\":\"I8\",\"shape\":[64,32],\"data_offsets\":[4100,6148]}," ++
+        "\"b.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[64,2],\"data_offsets\":[6148,6276]}," ++
+        "\"g.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[6276,6292]}}";
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    try file.appendSlice(a, &body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var sh = try Shards.open(a, io, dir);
+    defer sh.close(io);
+    // FP8 rows 32..64 (N) of columns 32..64 (K): bytes [32 + i][32..64]; its scale block (1, 1)
+    var w: [32 * 32]u8 = undefined;
+    try read(&sh, "a|(32, 64)|(32, 64)|w8", &w);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, body[(32 + i) * 64 + 32 ..][0..32], w[i * 32 ..][0..32]);
+    var sc: [1]u8 = undefined;
+    try read(&sh, "a|(32, 64)|(32, 64)|s8", &sc);
+    try std.testing.expectEqual(body[4096 + 3], sc[0]);
+    try std.testing.expectError(error.UnalignedSlice, describe(&sh, "a|(16, 64)|None|s8"));
+    // FP4 K 32..64 of rows 0..32: packed bytes 16..32 of each row; its scales: column 1 of each row
+    var w4: [32 * 16]u8 = undefined;
+    try read(&sh, "b|(0, 32)|(32, 64)|w4", &w4);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, body[4100 + i * 32 + 16 ..][0..16], w4[i * 16 ..][0..16]);
+    var s4: [32]u8 = undefined;
+    try read(&sh, "b|(0, 32)|(32, 64)|s4", &s4);
+    for (0..32) |i| try std.testing.expectEqual(body[6148 + i * 2 + 1], s4[i]);
+    // bf16 rows 2..4 whole, and bf16 widened to f32
+    var g: [8]u8 = undefined;
+    try read(&sh, "g|(2, 4)|None|bf", &g);
+    try std.testing.expectEqualSlices(u8, body[6276 + 8 ..][0..8], &g);
+    var gf: [32]u8 = undefined;
+    try read(&sh, "g.weight|torch.float32", &gf);
+    try std.testing.expectEqual(@as(u32, std.mem.readInt(u16, body[6276..6278], .little)) << 16, std.mem.readInt(u32, gf[0..4], .little));
 }
 
 test "loader keys parse as Python prints them" {

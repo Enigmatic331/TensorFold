@@ -406,6 +406,139 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
 }
 
+// The decode plan's Track B (docs/UNIFIED-DECODE-IMPROVEMENTS.md, TF_DS_SAMPLE_CAND=1): a row's first `count` (value,
+// id) in sampling.topCandidates' order (the larger value first, of equal values the lower id; +0 and -0 equal), on the
+// GPU, so the host's draws read count candidates instead of the whole row. logits [rows, n] fp32 (row stride ld); out
+// vals [rows, count] (the row's own values, signed zeros kept), ids [rows, count], flags [rows]: 1 when the row holds a
+// NaN (no total order: the host takes the full-row path) or more ties at the cut than the tie buffer holds (2: the same).
+// A row a block of 1024 threads: an exact radix select of the count-th largest key in four 8-bit passes, then the rows
+// above it and the lowest ids of its ties, sorted in that order. count <= 64.
+__device__ __forceinline__ unsigned cand_key(float v) {
+    const unsigned u = __float_as_uint(v == 0.f ? 0.f : v);  // +0 and -0 one key
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ bool cand_before(float va, long long ia, float vb, long long ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+extern "C" __global__ void __launch_bounds__(1024) tf_ds_top_cand_rows_kernel(const float* logits, unsigned long long ld,
+                                                                              int n, int count, float* vals,
+                                                                              long long* ids, int* flags) {
+    // (each pass's histogram is kept a warp: 32 x 256 counters; a warp's lanes that share a bin add once, by their
+    // leader: the top bits of logits fall in a handful of bins, where one shared counter would serialize the row)
+    constexpr int kTies = 2048, kWarps = 32;
+    __shared__ unsigned whist[kWarps][256];
+    __shared__ unsigned hist[256];
+    __shared__ unsigned s_prefix, s_mask, s_left, s_above, s_ties;
+    __shared__ float c_val[64];
+    __shared__ int c_id[64];
+    __shared__ int t_id[kTies];
+    const float* row = logits + (unsigned long long)blockIdx.x * ld;
+    const int k = count < n ? count : n;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x == 0) {
+        s_prefix = 0u;
+        s_mask = 0u;
+        s_left = (unsigned)k;
+        s_above = 0u;
+        s_ties = 0u;
+    }
+    // the k-th largest key, its bits from the top: a histogram of the next 8 bits among the keys matching the prefix
+    // so far (the first pass also finds a NaN: the row then has no total order)
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = threadIdx.x; b < kWarps * 256; b += blockDim.x) (&whist[0][0])[b] = 0u;
+        __syncthreads();
+        const unsigned prefix = s_prefix, mask = s_mask;
+        bool nan = false;
+        // every lane of a warp runs the same trip count (__match_any_sync needs the whole warp)
+        const int trips = (n + (int)blockDim.x - 1) / (int)blockDim.x;
+        for (int t = 0; t < trips; t++) {
+            const int i = t * (int)blockDim.x + (int)threadIdx.x;
+            unsigned bin = 256u;  // none
+            if (i < n) {
+                const float v = row[i];
+                if (shift == 24) nan |= v != v;
+                const unsigned key = cand_key(v);
+                if ((key & mask) == prefix) bin = (key >> shift) & 255u;
+            }
+            const unsigned peers = __match_any_sync(0xffffffffu, bin);
+            if (bin != 256u && lane == __ffs(peers) - 1) atomicAdd(&whist[warp][bin], (unsigned)__popc(peers));
+        }
+        if (shift == 24 && __syncthreads_or(nan)) {
+            if (threadIdx.x == 0) flags[blockIdx.x] = 1;
+            return;
+        }
+        __syncthreads();
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+            unsigned sum = 0u;
+            for (int w = 0; w < kWarps; w++) sum += whist[w][b];
+            hist[b] = sum;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned left = s_left, above = 0u;
+            int b = 255;
+            for (; b > 0; b--) {
+                if (above + hist[b] >= left) break;
+                above += hist[b];
+            }
+            s_left = left - above;
+            s_prefix = prefix | ((unsigned)b << shift);
+            s_mask = mask | (255u << shift);
+        }
+        __syncthreads();
+    }
+    const unsigned cut = s_prefix;  // the k-th largest key; s_left of its ties are in the top k
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const unsigned key = cand_key(row[i]);
+        if (key > cut) {
+            const unsigned at = atomicAdd(&s_above, 1u);
+            if (at < 64u) {
+                c_val[at] = row[i];
+                c_id[at] = i;
+            }
+        } else if (key == cut) {
+            const unsigned at = atomicAdd(&s_ties, 1u);
+            if (at < (unsigned)kTies) t_id[at] = i;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const unsigned above = s_above, ties = s_ties, left = s_left;
+    if (ties > (unsigned)kTies || above + left != (unsigned)k) {
+        flags[blockIdx.x] = 2;
+        return;
+    }
+    // the lowest `left` ids of the ties (selection: ties are few)
+    for (unsigned j = 0; j < left; j++) {
+        unsigned best = j;
+        for (unsigned q = j + 1; q < ties; q++)
+            if (t_id[q] < t_id[best]) best = q;
+        const int tmp = t_id[j];
+        t_id[j] = t_id[best];
+        t_id[best] = tmp;
+        c_val[above + j] = row[t_id[j]];
+        c_id[above + j] = t_id[j];
+    }
+    // the k candidates in topCandidates' order (insertion: k <= 64)
+    for (int a = 1; a < k; a++) {
+        const float v = c_val[a];
+        const int id = c_id[a];
+        int b = a;
+        while (b > 0 && cand_before(v, id, c_val[b - 1], c_id[b - 1])) {
+            c_val[b] = c_val[b - 1];
+            c_id[b] = c_id[b - 1];
+            b--;
+        }
+        c_val[b] = v;
+        c_id[b] = id;
+    }
+    for (int a = 0; a < k; a++) {
+        vals[(size_t)blockIdx.x * count + a] = c_val[a];
+        ids[(size_t)blockIdx.x * count + a] = c_id[a];
+    }
+    flags[blockIdx.x] = 0;
+}
+
 // ---- the vision tower (vit.zig): DeepSeek's ViT and aligner as the served lane runs them on torch, each torch op its
 // own rounding point (this file builds with --fmad=false, so a product and a sum stay two roundings).
 

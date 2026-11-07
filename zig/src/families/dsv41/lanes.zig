@@ -12,7 +12,10 @@
 //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
 //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
 //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
-//! stream's key at its own position, whatever the round's composition.
+//! stream's key at its own position, whatever the round's composition. Structured output: a stream with a grammar
+//! draws each row among its mask's tokens (the row with the others at -inf, drawn as any row), its first token from
+//! the prompt's last row the prompt pass kept for it (first_masked), and the round loop reads its held drafts as host
+//! tokens (held) to walk them through the grammar; rank 1 runs the same rounds, the masks are rank 0's alone.
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
@@ -37,7 +40,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, rdma_idle = 11 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -213,11 +216,57 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
 
 /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
 /// else the served sampler with the stream's key.
+/// draw from a row's first candidates (Track B): a greedy row's token is its first candidate (sampling.argmax's: the
+/// first index of the largest value; the GPU's flags send a row with a NaN down draw's path instead); a sampled row's
+/// is sampleRow's choice on its own candidateCount of them.
+pub fn drawCandidates(vals: []const f32, ids: []const i64, n: usize, position: u64, s: ?lanes.Sampling) !u32 {
+    const sm = s orelse return @intCast(ids[0]);
+    if (sm.temperature <= 0) return @intCast(ids[0]);
+    const smp: sampling.Sampling = .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p };
+    const c = sampling.candidateCount(n, smp);
+    if (c > vals.len) return error.TooManyCandidates;
+    return @intCast(try sampling.sampleCandidates(vals[0..c], ids[0..c], position, smp));
+}
+
+/// TF_DS_SAMPLE_CAND=1: Track B's candidates path for sampled rounds. Unset or any other value: the whole logits.
+fn candOn() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |x| return x;
+    const x = if (std.c.getenv("TF_DS_SAMPLE_CAND")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
+    S.v = x;
+    return x;
+}
+
 pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     const sm = s orelse return @intCast(sampling.argmax(row));
     if (sm.temperature <= 0) return @intCast(sampling.argmax(row));
     const t = try sampling.sampleRow(row, position, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p });
     return @intCast(t);
+}
+
+/// A row's draw among a grammar's allowed tokens (token t: bit t % 32 of word t / 32, lanes/grammar.zig): the row
+/// with every other token at -inf (written into `buf`, the row's width), drawn as `draw` draws any row.
+pub fn drawMasked(buf: []f32, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+    var allowed = false;
+    for (buf, row, 0..) |*x, v, id| {
+        const on = lanes.grammar.allows(mask, id);
+        x.* = if (on) v else -std.math.inf(f32);
+        allowed = allowed or on;
+    }
+    if (!allowed) return error.NoAllowedToken;
+    return draw(buf, position, s);
+}
+
+/// A row's mask width in words: one bit a token.
+pub fn maskWords(vocab: usize) usize {
+    return (vocab + 31) / 32;
+}
+
+/// A window's masks: none, or each row's bits (rows x words).
+fn masksFit(w: be.Window, words: usize) bool {
+    return w.masks.len == 0 or w.masks.len == w.rows() * words;
 }
 
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
@@ -258,6 +307,20 @@ const Lane = struct {
     nheld: usize = 0,
 };
 
+/// Host-owned prompt progress; the KV rows and rings already live in its slot between chunks.
+const Fill = struct {
+    start: usize,
+    replay: usize,
+    last_end: usize,
+    spans: std.ArrayList(@import("prompt.zig").Span),
+    rows: std.ArrayList(u8),
+
+    fn deinit(f: *Fill, gpa: std.mem.Allocator) void {
+        f.spans.deinit(gpa);
+        f.rows.deinit(gpa);
+    }
+};
+
 extern "c" fn exp(x: f64) f64;
 
 /// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
@@ -287,12 +350,15 @@ pub const Lanes = struct {
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
+    rdma_idle: bool = false,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
     used: [max_streams]bool = @splat(false),
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
+    fills: [max_streams]?Fill = @splat(null),
+    filling_slot: ?usize = null,
     built: Built = .{},
     prof: ?Profile = null,
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
@@ -304,6 +370,11 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
+    // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
+    first_row: []f32 = &.{},
+    first_of: ?*const lanes.Stream = null,
+    masked: []f32 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -322,24 +393,38 @@ pub const Lanes = struct {
         }
         self.snaps.deinit(self.gpa);
         if (self.peer != null) self.send(.done) catch {};
+        for (&self.fills) |*f| if (f.*) |*x| x.deinit(self.gpa);
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
+        self.gpa.free(self.first_row);
+        self.gpa.free(self.masked);
     }
 
+    /// TF_DS_PREFILL_YIELD=1: the served host advances a prompt a chunk at a time (prefillStep), admitting the queued
+    /// requests and running the live streams' rounds between its chunks. Else the whole prompt in one call, as served.
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
-            .prefill = prefillFn,
-            .first = firstFn,
-            .queue = queueFn,
-            .read = readFn,
-            .verify = verifyFn,
-            .keep = keepFn,
-            .draft = draftFn,
-            .probabilities = probabilitiesFn,
-            .release = releaseFn,
-        } };
+        return .{ .ptr = self, .vtable = if (yieldOn()) &vt_stepping else &vt_whole };
     }
+
+    const vt_whole: be.Backend.VTable = .{
+        .prefill = prefillFn,
+        .first = firstFn,
+        .queue = queueFn,
+        .read = readFn,
+        .verify = verifyFn,
+        .keep = keepFn,
+        .draft = draftFn,
+        .probabilities = probabilitiesFn,
+        .first_masked = firstMaskedFn,
+        .held = heldFn,
+        .release = releaseFn,
+    };
+    const vt_stepping: be.Backend.VTable = blk: {
+        var v = vt_whole;
+        v.prefill_step = prefillStep;
+        break :blk v;
+    };
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
@@ -361,7 +446,45 @@ pub const Lanes = struct {
             .shared_costs = self.sc[0..self.m.eng.round_rows],
             .draft_probabilities = drafting,
             .draft_streams = drafting,
+            .prepass = drafting and prepassOn(),
+            .pass_ms = passMs(),
+            .draft_row_ms = draftRowMs(),
         };
+    }
+
+    /// TF_DS_PREPASS=1: the decode plan's A2 pre-pass choice (core/lanes/depth.zig Rule.prepassSelect). Unset or any other value: off.
+    fn prepassOn() bool {
+        const v = std.c.getenv("TF_DS_PREPASS") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
+    }
+
+    /// TF_DS_PREFILL_YIELD=1: Track D, a decode round of the live streams between a prompt's chunks, and in the served
+    /// host the queued requests admitted between them too (0031's bounded prefill). Unset or any other value: the whole
+    /// prompt first, as served.
+    fn yieldOn() bool {
+        const v = std.c.getenv("TF_DS_PREFILL_YIELD") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
+    }
+
+    /// TF_DS_DRAFT_ROW_MS=d: A3, the shared rounds' draft rows priced at d ms each apart from the streams' rows (the
+    /// round table at the streams' count): the lane profiles of 2026-10-25 measured ~2.6-3.1 ms a draft row against
+    /// ~4.4 ms a stream's row at c1-c2. Unset or 0: the table at the round's total rows, as served.
+    fn draftRowMs() f64 {
+        const v = std.c.getenv("TF_DS_DRAFT_ROW_MS") orelse return 0.0;
+        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.0;
+    }
+
+    /// TF_DS_PASS_MS="a,b": the batched pass's ms for N drafting streams, a + b N (prepass's price of the pass). Unset:
+    /// 2.6 + 1.1 N, the fit of the lane profiles of 2026-10-25 (4.0 ms at 1 stream, 6.0 at 3.2, 9.0 at 5.8).
+    fn passMs() [2]f64 {
+        var out: [2]f64 = .{ 2.6, 1.1 };
+        const v = std.c.getenv("TF_DS_PASS_MS") orelse return out;
+        var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+        for (&out) |*o| {
+            const t = it.next() orelse break;
+            o.* = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch o.*;
+        }
+        return out;
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -389,6 +512,10 @@ pub const Lanes = struct {
     }
 
     fn begin(self: *Lanes, kind: Kind) !bool {
+        if (usesRdma(kind) and self.rdma_idle) {
+            setRdmaIdle(self.m, false);
+            self.rdma_idle = false;
+        }
         if (self.peer == null) return false;
         try self.wire.begin(self.gpa, kind, self.step);
         self.step += 1;
@@ -399,25 +526,71 @@ pub const Lanes = struct {
         if (try self.begin(kind)) try self.flush();
     }
 
+    /// Two-phase world-wide idle boundary. No rank parks while another may
+    /// still need it as an RDMA relay. All streams/CUDA graphs finish first.
+    pub fn idleRdma(self: *Lanes) !void {
+        if (self.rdma_idle or self.streams.count() != 0 or !hasRdma(self.m)) return;
+        self.m.joinAhead();
+        try self.m.ctx.synchronize();
+        try self.send(.rdma_idle);
+        var ack: [64]u8 = undefined;
+        for (self.m.followers()) |l| {
+            if (!std.mem.eql(u8, try l.?.recv(&ack), idle_ready)) return error.BadIdleAck;
+        }
+        // Every GPU is quiescent now; only then permit any proxy to park.
+        for (self.m.followers()) |l| try l.?.send(idle_commit);
+        setRdmaIdle(self.m, true);
+        self.rdma_idle = true;
+    }
+
     // -- the vtable ---------------------------------------------------------------------------------------------
 
-    /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
-    /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
+    /// The whole prompt (TF_DS_PREFILL_YIELD unset, and the standalone path); the served host with it set advances
+    /// prefillStep one chunk at a time instead.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        const self = of(ptr);
+        while (!try prefillStep(ptr, s)) {
+            if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) try b.run(b.ptr);
+        }
+    }
+
+    fn fillImages(self: *Lanes, spans: []const @import("prompt.zig").Span, rows: []const u8) !void {
+        const gpa = self.gpa;
+        const m = self.m;
+        if (spans.len > 0) {
+            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+            // the ids of a full pool)
+            var off: usize = 0;
+            while (off < rows.len) {
+                const n = @min(image_piece, rows.len - off);
+                if (try self.begin(.fill_images)) {
+                    try self.wire.int(gpa, u32, @intCast(spans.len));
+                    for (spans) |sp| {
+                        try self.wire.int(gpa, u64, sp.at);
+                        try self.wire.int(gpa, u64, sp.len);
+                    }
+                    try self.wire.int(gpa, u64, off);
+                    try self.wire.buf.appendSlice(gpa, rows[off..][0..n]);
+                    try self.flush();
+                }
+                off += n;
+            }
+            try m.setImages(spans, rows);
+        }
+    }
+
+    /// Placement, image encoding and a cached restore happen once, before this prompt's first chunk.
+    fn startFill(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
         const gpa = self.gpa;
-        const t0 = m.now();
-        defer if (self.prof) |*p| {
-            p.prefill += m.now() - t0;
-            p.prefills += 1;
-        };
+        m.joinAhead();
+        m.fill_seq = &.{};
+        self.filling_slot = null; // a failed setup must not leave another prompt's slot falsely selected
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.ctx_cap) return error.PromptTooLong;
-        if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+        releaseFn(self, s);
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
         var nt: usize = 0;
@@ -433,8 +606,8 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
-            if (s.images.len == 0 and self.usable(sn, len)) {
+            // (the host's cache keys a state by its images too: a resumed prefix holds the same pictures)
+            if (self.usable(sn, len)) {
                 kept = sn;
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
@@ -458,6 +631,7 @@ pub const Lanes = struct {
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
+            self.idleRdma() catch |err| std.debug.panic("RDMA idle after prefill error: {s}", .{@errorName(err)});
         }
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
@@ -465,9 +639,9 @@ pub const Lanes = struct {
         // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
         // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
-        defer spans.deinit(gpa);
+        errdefer spans.deinit(gpa);
         var rows: std.ArrayList(u8) = .empty;
-        defer rows.deinit(gpa);
+        errdefer rows.deinit(gpa);
         if (s.images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
@@ -478,6 +652,8 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
+                // The keyed snapshot already contains these image rows; only a span crossing its cut needs encoding.
+                if (kept) |sn| if (@as(usize, img.at) + img.tokens <= sn.at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
@@ -497,26 +673,7 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
-        if (spans.items.len > 0) {
-            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
-            // the ids of a full pool)
-            var off: usize = 0;
-            while (off < rows.items.len) {
-                const n = @min(image_piece, rows.items.len - off);
-                if (try self.begin(.fill_images)) {
-                    try self.wire.int(gpa, u32, @intCast(spans.items.len));
-                    for (spans.items) |sp| {
-                        try self.wire.int(gpa, u64, sp.at);
-                        try self.wire.int(gpa, u64, sp.len);
-                    }
-                    try self.wire.int(gpa, u64, off);
-                    try self.wire.buf.appendSlice(gpa, rows.items[off..][0..n]);
-                    try self.flush();
-                }
-                off += n;
-            }
-            try m.setImages(spans.items, rows.items);
-        }
+        try self.fillImages(spans.items, rows.items);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
@@ -533,28 +690,78 @@ pub const Lanes = struct {
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
-        // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
-        // kept prompt), each at the chunk end at or before it
-        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        var head = false;
-        m.fill_seq = seq.items;
-        defer {
+        self.fills[slot] = .{
+            .start = start,
+            .replay = replay,
+            .last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows,
+            .spans = spans,
+            .rows = rows,
+        };
+        self.filling_slot = slot;
+    }
+
+    /// Select a partially filled slot on every rank, without resending its full prompt or re-encoding its images.
+    fn selectFill(self: *Lanes, slot: usize, base: usize) !void {
+        const m = self.m;
+        if (self.filling_slot != slot) {
+            self.filling_slot = null;
+            m.joinAhead();
+            m.fill_seq = &.{};
+            if (try self.begin(.fill_resume)) {
+                try self.wire.int(self.gpa, u32, @intCast(slot));
+                try self.wire.int(self.gpa, u64, base);
+                try self.flush();
+            }
+            try m.fillBegin(slot, base);
+            const f = &self.fills[slot].?;
+            try self.fillImages(f.spans.items, f.rows.items);
+            self.filling_slot = slot;
+        }
+        m.fill_seq = self.seqs[slot].items;
+    }
+
+    /// One unchanged 2048-row chunk. Other prompts and decode rounds can run before its next chunk.
+    fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const self = of(ptr);
+        const m = self.m;
+        const gpa = self.gpa;
+        const t0 = m.now();
+        defer if (self.prof) |*p| {
+            p.prefill += m.now() - t0;
+        };
+        errdefer {
             m.joinAhead();
             m.fill_seq = &.{};
         }
-        while (start < len) {
-            if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
-            if (try self.begin(.fill_chunk)) {
-                try self.wire.int(gpa, u64, start);
-                try self.wire.int(gpa, u32, @intCast(n));
-                try self.wire.int(gpa, u64, replay);
-                try self.flush();
-            }
-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
-            start += n;
-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+        if (s.isCancelled()) return error.Cancelled;
+        if (!self.streams.contains(s)) try self.startFill(s);
+        const lane = self.streams.get(s).?;
+        try self.selectFill(lane.slot, lane.base);
+        const f = &self.fills[lane.slot].?;
+        const seq = &self.seqs[lane.slot];
+        const len = s.prompt_len;
+        const n = @min(model.chunk_rows, len - f.start);
+        if (try self.begin(.fill_chunk)) {
+            try self.wire.int(gpa, u64, f.start);
+            try self.wire.int(gpa, u32, @intCast(n));
+            try self.wire.int(gpa, u64, f.replay);
+            try self.flush();
         }
+        const head = try m.fillChunk(seq.items[0 .. f.start + n], f.start, n, f.replay);
+        f.start += n;
+        if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and
+            (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+        if (f.start < len) {
+            // Leave read-ahead running for a prompt alone; a slot switch joins it in startFill/selectFill. Without
+            // TF_DS_PREFILL_YIELD no round runs between the chunks, so the read-ahead runs on, as served
+            if (yieldOn()) if (s.between) |b| if (b.ready(b.ptr)) {
+                m.joinAhead();
+                m.fill_seq = &.{};
+            };
+            return false;
+        }
+        m.joinAhead();
+        m.fill_seq = &.{};
         if (!head) return error.NoPromptLogits;
         const logits = try m.promptLogitsHost();
         if (logits_sha) {
@@ -564,6 +771,16 @@ pub const Lanes = struct {
         }
         const token = try draw(logits, len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
+        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
+        if (s.grammar != null) {
+            self.first_row = try self.gpa.realloc(self.first_row, logits.len);
+            @memcpy(self.first_row, logits);
+            self.first_of = s;
+        }
+        f.deinit(gpa);
+        self.fills[lane.slot] = null;
+        if (self.prof) |*p| p.prefills += 1;
+        return true;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -571,6 +788,30 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+    }
+
+    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
+    /// with the other tokens at -inf, at the same keyed position.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        if (self.first_of != s) return error.NoPromptRow;
+        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+    }
+
+    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.nheld) return error.HeldMismatch;
+        @memcpy(out, l.held[0..out.len]);
+    }
+
+    /// drawMasked into the backend's row.
+    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+        self.masked = try self.gpa.realloc(self.masked, row.len);
+        return drawMasked(self.masked, row, position, s, mask);
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -593,6 +834,8 @@ pub const Lanes = struct {
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
+        const words = maskWords(m.vocab);
+        var masked = false;
         for (windows, 0..) |w, k| {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
@@ -601,6 +844,8 @@ pub const Lanes = struct {
             const start: usize = @intCast(w.stream.cache_len);
             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
             if (w.held > l.nheld) return error.HeldMismatch;
+            if (!masksFit(w, words)) return error.BadMasks;
+            masked = masked or w.masks.len > 0;
             ids[k][0] = @intCast(w.pending);
             for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
@@ -623,15 +868,33 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
-        var greedy = true;
+        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
+        var greedy = !masked;
         for (windows) |w| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
             };
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        // Track B (TF_DS_SAMPLE_CAND=1): a sampled round's rows as their first candidates from the GPU (the host's
+        // draws read only those; sampling.sampleCandidates), the whole logits only when a row needs them
+        var cand_count: usize = 0;
+        if (!greedy and !masked and candOn()) { // a masked row is drawn from its whole row
+            cand_count = 1;
+            for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                if (sm.top_k == 0 or sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }) > sampling.max_candidates) {
+                    cand_count = 0;
+                    break;
+                }
+                cand_count = @max(cand_count, sampling.candidateCount(m.vocab, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }));
+            };
+        }
+        const cand = if (cand_count > 0) try m.roundCandidates(rows.ids.len, cand_count) else null;
+        var whole = cand == null;
+        if (cand) |cd| for (cd.flags) |fl| {
+            whole = whole or fl != 0;
+        };
+        const logits: []const f32 = if (greedy or !whole) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -646,7 +909,14 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy)
+                tokens[row0 + r]
+            else if (w.masks.len > 0)
+                try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
+            else if (!whole)
+                try drawCandidates(cand.?.vals[(row0 + r) * cand_count ..][0..cand_count], cand.?.ids[(row0 + r) * cand_count ..][0..cand_count], V, w.positions[r], w.stream.sampling)
+            else
+                try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -737,7 +1007,7 @@ pub const Lanes = struct {
         if (self.served_k == .all or (self.served_k == .solo and live == 1)) {
             const drafts: usize = if (self.m.dr) |dr| dr.n else 1;
             const kmax = @min(out.len, draft.depth(live, drafts, self.m.eng.round_rows));
-            const k = draft.chooseK(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows);
+            const k = draft.chooseKWith(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows, self.m.round_ms, draft.cost_ms, draftRowMs());
             for (out[k..]) |*o| o.* = 0.0;
         }
         return true;
@@ -853,16 +1123,50 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
-        const kv = self.streams.fetchRemove(s) orelse return;
-        self.used[kv.value.slot] = false;
+        if (self.first_of == s) self.first_of = null;
+        if (self.streams.fetchRemove(s)) |kv| {
+            const slot = kv.value.slot;
+            if (self.fills[slot]) |*f| {
+                if (self.filling_slot == slot) {
+                    self.m.joinAhead();
+                    self.m.fill_seq = &.{};
+                }
+                f.deinit(self.gpa);
+                self.fills[slot] = null;
+            }
+            if (self.filling_slot == slot) self.filling_slot = null;
+            self.used[slot] = false;
+        }
+        self.idleRdma() catch |err| std.debug.panic("RDMA idle transition failed: {s}", .{@errorName(err)});
     }
 };
+
+const idle_ready = "rdma-idle-ready-v1";
+const idle_commit = "rdma-idle-commit-v1";
+
+fn usesRdma(kind: Kind) bool {
+    return switch (kind) {
+        .fill_begin, .fill_chunk, .verify, .pass => true,
+        else => false,
+    };
+}
+
+fn hasRdma(m: *const Model) bool { return m.ring != null or m.rdma_rings != null; }
+
+fn setRdmaIdle(m: *Model, idle: bool) void {
+    if (m.ring) |r| { if (idle) r.park() else r.wake(); }
+    if (m.rdma_rings) |rs| {
+        for ([_]*@import("rdma.zig").Ring{rs.all4, rs.col, rs.pair}) |r| {
+            if (idle) r.park() else r.wake();
+        }
+    }
+}
 
 /// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
 pub fn survivals(conf: []const f32, out: []f64) void {
     var surv: f64 = 1.0;
     for (out, conf[0..out.len]) |*o, cf| {
-        surv *= 1.0 / (1.0 + exp(-@as(f64, cf)));
+        surv *= draft.landing(cf);
         o.* = surv;
     }
 }
@@ -887,6 +1191,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     defer for (&win_ids) |*q| q.deinit(gpa);
     var built: Built = .{};
     var step: u64 = 0;
+    var rdma_idle = false;
     var slot: usize = 0;
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
@@ -899,7 +1204,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     while (true) {
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
-        var r: Reader = .{ .b = try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
+        var r: Reader = .{ .b = if (rdma_idle) try peer.recv(buf) else try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
         const kind: Kind = switch (try r.int(u8)) {
             1 => .fill_begin,
             2 => .fill_chunk,
@@ -910,8 +1215,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .fill_resume,
+            11 => .rdma_idle,
             else => return error.BadFrame,
         };
+        if (usesRdma(kind) and rdma_idle) {
+            setRdmaIdle(m, false);
+            rdma_idle = false;
+        }
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
@@ -929,11 +1240,22 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
+            .fill_resume => {
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                if (slot >= max_streams) return error.BadSlot;
+                img_rows.clearRetainingCapacity();
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fill_seq = seqs[slot].items;
+            },
             .fill_chunk => {
                 const start: usize = @intCast(try r.int(u64));
                 const n: usize = try r.int(u32);
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
+                // a round between this prompt's chunks (Track D) joined the read-ahead and cleared its sequence: rank 0
+                // puts its own back, and so does this rank (the same reads either way; the same bits)
+                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items;
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
             },
             .verify => {
@@ -1022,6 +1344,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     b.free();
                 }
             },
+            .rdma_idle => {
+                try m.ctx.synchronize();
+                try peer.send(idle_ready);
+                if (!std.mem.eql(u8, try peer.recv(buf), idle_commit)) return error.BadIdleCommit;
+                setRdmaIdle(m, true);
+                rdma_idle = true;
+            },
             .done => return,
         }
     }
@@ -1086,4 +1415,108 @@ test "greedy draws take the first largest logit" {
     const row = [_]f32{ 0.5, 2.0, -1.0, 2.0 };
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+}
+
+/// A test row: token i's logit from splitmix64(i + 1) (exact in f32, a few ties).
+fn testRow(row: []f32) void {
+    for (row, 0..) |*x, i| {
+        var z: u64 = @as(u64, i + 1) *% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        x.* = @as(f32, @floatFromInt((z ^ (z >> 31)) >> 52)) / 256.0 - 8.0;
+    }
+}
+
+test "a masked draw is the row's draw with the other tokens at -inf, and never a disallowed token" {
+    const V = 1000;
+    var row: [V]f32 = undefined;
+    testRow(&row);
+    var buf: [V]f32 = undefined;
+    var off: [V]f32 = undefined;
+    var mask: [maskWords(V)]u32 = @splat(0);
+    for (0..V) |i| if (i % 7 == 3 or i % 250 == 1) {
+        mask[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+    };
+    for (&off, row, 0..) |*o, v, i| o.* = if (lanes.grammar.allows(&mask, i)) v else -std.math.inf(f32);
+    const all: [maskWords(V)]u32 = @splat(std.math.maxInt(u32));
+    const settings = [_]?lanes.Sampling{
+        null,
+        .{ .seed = 5, .temperature = 0 },
+        .{ .seed = 11, .temperature = 1.0, .top_k = 1 },
+        .{ .seed = 12, .temperature = 1.0, .top_k = 20, .top_p = 0.95 },
+        .{ .seed = 13, .temperature = 0.7, .top_k = 56, .top_p = 0.9, .min_p = 0.05 },
+        .{ .seed = 14, .temperature = 1.3, .top_k = 40, .top_p = 1.0 },
+    };
+    for (settings) |s| for ([_]u64{ 0, 17, 4096, 1 << 20 }) |position| {
+        const got = try drawMasked(&buf, &row, position, s, &mask);
+        try std.testing.expect(lanes.grammar.allows(&mask, got));
+        try std.testing.expectEqual(try draw(&off, position, s), got);
+        // every token allowed: the row's own draw
+        try std.testing.expectEqual(try draw(&row, position, s), try drawMasked(&buf, &row, position, s, &all));
+    };
+    // greedy: the first largest allowed logit
+    var best: ?usize = null;
+    for (row, 0..) |v, i| if (lanes.grammar.allows(&mask, i) and (best == null or v > row[best.?])) {
+        best = i;
+    };
+    try std.testing.expectEqual(@as(u32, @intCast(best.?)), try drawMasked(&buf, &row, 3, null, &mask));
+    // one token allowed: that token at any sampling
+    var one: [maskWords(V)]u32 = @splat(0);
+    one[999 / 32] = @as(u32, 1) << (999 % 32);
+    for (settings) |s| try std.testing.expectEqual(@as(u32, 999), try drawMasked(&buf, &row, 9, s, &one));
+    // nothing allowed: no draw
+    try std.testing.expectError(error.NoAllowedToken, drawMasked(&buf, &row, 9, null, &@as([maskWords(V)]u32, @splat(0))));
+}
+
+test "a stream with a grammar draws its first token from the kept prompt row, and its held drafts read back as host tokens" {
+    const gpa = std.testing.allocator;
+    // no model here: rdma_idle set, so release (0034) has no RDMA proxies to park
+    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null, .rdma_idle = true };
+    defer ln.deinit();
+    const b = ln.backend();
+    try std.testing.expect(b.vtable.first_masked != null and b.vtable.held != null);
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8, .sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 } });
+    defer s.deinit(gpa);
+    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = model.chunk_rows });
+    ln.used[0] = true;
+    var row: [1000]f32 = undefined;
+    testRow(&row);
+    var mask: [maskWords(1000)]u32 = @splat(0);
+    for ([_]usize{ 4, 100, 640, 999 }) |t| mask[t / 32] |= @as(u32, 1) << @intCast(t % 32);
+    // no kept row (the stream had no grammar at its prompt pass): no masked draw
+    try std.testing.expectError(error.NoPromptRow, b.vtable.first_masked.?(b.ptr, &s, 3, &mask));
+    ln.first_row = try gpa.dupe(f32, &row);
+    ln.first_of = &s;
+    try std.testing.expectError(error.PositionMismatch, b.vtable.first_masked.?(b.ptr, &s, 2, &mask));
+    var buf: [1000]f32 = undefined;
+    const want = try drawMasked(&buf, &row, 3, s.sampling, &mask);
+    try std.testing.expectEqual(want, try b.read(try b.vtable.first_masked.?(b.ptr, &s, 3, &mask)));
+    // the drafts the last pass held, in window order
+    const l = ln.streams.getPtr(&s).?;
+    l.held[0..3].* = .{ 50, 51, 52 };
+    l.nheld = 3;
+    var out: [2]u32 = undefined;
+    try b.vtable.held.?(b.ptr, &s, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 50, 51 }, &out);
+    var four: [4]u32 = undefined;
+    try std.testing.expectError(error.HeldMismatch, b.vtable.held.?(b.ptr, &s, &four));
+    // a released stream's row is no one's
+    b.release(&s);
+    try std.testing.expect(ln.first_of == null);
+}
+
+test "a window's masks are none or every row's bits" {
+    const gpa = std.testing.allocator;
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 4 });
+    defer s.deinit(gpa);
+    const words = maskWords(129280);
+    try std.testing.expectEqual(@as(usize, 4040), words);
+    const bits: [3 * 4040]u32 = @splat(1);
+    const w: be.Window = .{ .stream = &s, .pending = 1, .held = 0, .tokens = &.{ 2, 3 }, .parents = null, .positions = &.{ 2, 3, 4 } };
+    try std.testing.expect(masksFit(w, words));
+    var with = w;
+    with.masks = &bits;
+    try std.testing.expect(masksFit(with, words));
+    with.masks = bits[0 .. 2 * words];
+    try std.testing.expect(!masksFit(with, words));
 }

@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !u8 {
     var width: u32 = 2560;
     var reps: u32 = 500;
     var pdl = true;
-    var gid: u8 = 5;
+    var gid: ?u8 = null;
     var i: usize = 6;
     while (i + 1 < args.len) : (i += 2) {
         const k = args[i];

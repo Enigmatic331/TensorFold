@@ -90,4 +90,12 @@ pub const Blas = struct {
         const zero: f32 = 0;
         try b.check(b.api.cublasSgemm_v2(b.handle, .n, .n, 1, @intCast(rows), @intCast(k), &one, v, 1, x, @intCast(k), &zero, out, 1));
     }
+
+    /// The same product as xv (out [rows] = x [rows, k] @ v [k], fp32) as an m = rows, n = 1 GEMM: cuBLAS's m = 1 shape
+    /// runs ~2.5 ms on a GB10 for the drafter's 5 x 5376 confidence rows, this one microseconds.
+    pub fn xvT(b: *const Blas, x: u64, v: u64, out: u64, rows: usize, k: usize) Error!void {
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(rows), 1, @intCast(k), &one, x, @intCast(k), v, @intCast(k), &zero, out, @intCast(rows)));
+    }
 };

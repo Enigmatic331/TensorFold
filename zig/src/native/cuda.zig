@@ -215,6 +215,12 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_step = if (v.prefill_step != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
+                }
+            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -273,6 +279,18 @@ const Host = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, out: []lanes.backend.Alternative) anyerror!usize {
                     const x = bind(p);
                     return x.inner.vtable.alternatives.?(x.inner.ptr, s, out);
+                }
+            }.f else null,
+            .first_masked = if (v.first_masked != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+                    const x = bind(p);
+                    return x.inner.vtable.first_masked.?(x.inner.ptr, s, position, mask);
+                }
+            }.f else null,
+            .held = if (v.held != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+                    const x = bind(p);
+                    return x.inner.vtable.held.?(x.inner.ptr, s, out);
                 }
             }.f else null,
             .release = struct {
@@ -377,7 +395,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .prompt_cache = h.cache != null, .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
@@ -510,4 +528,21 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+test "the CUDA context wrapper forwards bounded prefill and keeps its capability optional" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var h: Host = undefined;
+    h.gpu = null;
+    h.inner = target.backend();
+    try std.testing.expect(h.backend().vtable.prefill_step == null);
+    h.inner = target.chunkedBackend();
+    const be = h.backend();
+    var s = try lanes.Stream.init(gpa, .{ .id = "partial", .prompt = &.{ 1, 2, 3, 4, 5 }, .max_new = 1 });
+    defer s.deinit(gpa);
+    defer be.release(&s);
+    try std.testing.expect(!try be.vtable.prefill_step.?(be.ptr, &s));
+    try std.testing.expect(try be.vtable.prefill_step.?(be.ptr, &s));
 }

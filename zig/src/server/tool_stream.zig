@@ -49,6 +49,9 @@ pub const Streamer = struct {
     held: []const u8 = "",
     streamed: bool = false,
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+    /// The template writes DSML calls (`tool_grammar.writesDsml`): no call is streamed, and the reply's calls reach the
+    /// client from the parse at its end, as they reach a non-streaming one.
+    calls_off: bool = false,
 
     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
@@ -78,6 +81,7 @@ pub const Streamer = struct {
 
     /// The deltas the reply's ``text`` (its whole answer so far) adds.
     pub fn feed(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        if (s.calls_off) return;
         while (s.state != .abort) {
             const rest = text[@min(s.pos, text.len)..];
             switch (s.state) {
@@ -385,6 +389,49 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one" 
 }
 
 const tool_parse = @import("tool_parse.zig");
+
+test "a DSML template's reply streams no call, so its parsed calls reach the client, tool markup in a value or not" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const qwen = "<tool_call><function=write></function></tool_call>";
+    for ([_]bool{ true, false }) |v41| {
+        const x = if (v41) " " else "";
+        const bn = if (v41) "calls" else "tool_calls";
+        const call = struct {
+            fn one(al: Allocator, sp: []const u8, value: []const u8) ![]const u8 {
+                return std.mem.concat(al, u8, &.{ "\n<", D, sp, "invoke name=\"write\">\n<", D, sp, "parameter name=\"content\" string=\"true\">", value, "</", D, sp, "parameter>\n</", D, sp, "invoke>" });
+            }
+        };
+        const open = try std.mem.concat(a, u8, &.{ "<", D, x, bn, ">" });
+        const close = try std.mem.concat(a, u8, &.{ "</", D, x, bn, ">" });
+        // a value holding Qwen markup; one holding the block's closer and Qwen markup, then a second call (the review
+        // case); Qwen markup in prose after a block
+        const replies = [_][]const u8{
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, qwen), "\n", close }),
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, try std.mem.concat(a, u8, &.{ close, qwen })), try call.one(a, x, "two"), "\n", close }),
+            try std.mem.concat(a, u8, &.{ open, try call.one(a, x, "one"), "\n", close, "\nThe other format: ", qwen }),
+        };
+        for (replies) |text| {
+            var st = try Streamer.init(a, tools);
+            st.calls_off = true;
+            var out: std.ArrayList(Value) = .empty;
+            for (1..text.len + 1) |n| try st.feed(text[0..n], &out);
+            try std.testing.expect(!st.streamed); // the route then sends the parsed calls
+            try std.testing.expectEqual(@as(usize, 0), out.items.len);
+            const r = try tool_parse.parse(a, text, tools, null);
+            for (r.calls.?) |c| try std.testing.expectEqualStrings("write", c.get("function").?.get("name").?.string);
+        }
+        // the review case: the two intended calls, the first value intact
+        const two = (try tool_parse.parse(a, replies[1], tools, null)).calls.?;
+        try std.testing.expectEqual(@as(usize, 2), two.len);
+        try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "{\"content\":\"", close, qwen, "\"}" }), two[0].get("function").?.get("arguments").?.string);
+    }
+    // a template that writes <tool_call> calls still streams them as they are written
+    try std.testing.expect((try streamed(a, tools, &.{qwen})).len > 0);
+}
 
 /// The deltas one streamer sends while the reply grows through ``texts``.
 fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {

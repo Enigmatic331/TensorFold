@@ -3,6 +3,8 @@
 //! node (the same model directory, rank cache, kit, pool and port). The ranks link over TCP and NCCL; the inputs
 //! beyond the checkpoint come from the environment:
 //!   TF_TP_WORLD (2), TF_TP_MASTER, TF_TP_PORT   the ranks: rank 0's fabric address and port (rank 1 connects)
+//!   TF_TP_LISTEN                                world 4: rank 0's address for each follower, "a,b,c" (ranks 1-3: the
+//!                                               address each was given; unset: TF_TP_MASTER for all)
 //!   TF_DS_RANK_CACHE                            the lane's per-rank weight files (the Python lane's TF_DS_RANK_CACHE)
 //!   TF_DS_KIT                                   cubins/ (the served extension cubins), the served RoPE tables
 //!                                               (rope-*.f32, as many rows as the context) and engram.json
@@ -20,6 +22,10 @@
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+//!   TF_DS_ENGRAM_PACKED=DIR                     Engram rows from tf-dsv41-engram-pack's shards in DIR: a record a row,
+//!                                               a row cache (TF_DS_ENGRAM_CACHE_MIB, 2048), decoded on the GPU;
+//!                                               TF_DS_ENGRAM_OWNED=1: each node reads its own range of the rows;
+//!                                               TF_DS_ENGRAM_INSTREAM=1: a round's landing as a stream host step
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
@@ -116,6 +122,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
+    const listen: ?[3][4]u8 = if (getenv("TF_TP_LISTEN")) |t| blk: {
+        var out: [3][4]u8 = undefined;
+        var it = std.mem.splitScalar(u8, t, ',');
+        for (&out) |*a| a.* = link.parseIp(it.next() orelse return error.BadMaster) catch return error.BadMaster;
+        if (it.next() != null) return error.BadMaster;
+        break :blk out;
+    } else null;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
     const window = if (getenv("TF_DS_WINDOW")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadWindow else o.context;
     if (window < o.context) return error.BadWindow;
@@ -130,6 +143,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .rank = 0,
         .world = world,
         .master = master,
+        .listen = listen,
         .port = port,
         .engram_dir = getenv("TF_DS_ENGRAM"),
         .token_map = getenv("TF_DS_TOKEN_MAP"),
@@ -149,6 +163,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    errdefer st.lanes.deinit();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
@@ -159,6 +174,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
+    try st.lanes.idleRdma(); // park even before the first API request
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 }
 

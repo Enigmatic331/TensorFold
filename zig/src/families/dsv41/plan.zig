@@ -119,6 +119,11 @@ pub const Want = struct {
     n16: ?usize = null,
 };
 
+/// A native linear's storage (Format.native): FP8 E4M3 with UE8M0 scales on 32 x 32 blocks, MXFP4 (E2M1 pairs) with a
+/// UE8M0 scale per 32 values of a row, or bf16. Its parts' keys: "prefix|cols|rows|w8" and "|s8", "|w4" and "|s4",
+/// "|bf" (cols: output columns, dim 0 of the [N, K] weight; rows: input rows, dim 1), the split's ranges as for EXL3.
+pub const Native = enum { fp8, fp4, nv4, bf16 };
+
 /// plain(name, dtype)'s key: f"{name}|{dtype}", the dtype as torch prints it.
 pub fn plainKey(buf: []u8, tensor: []const u8, dtype: ?DType) ![]const u8 {
     const t = if (dtype) |d| switch (d) {
@@ -155,6 +160,21 @@ const Builder = struct {
             const key = try b.a.dupe(u8, try partKey(&buf, prefix, cols, rows, part));
             const is_tr = std.mem.eql(u8, part, "tr");
             try b.out.append(b.a, .{ .key = key, .dtype = if (is_tr) .i16 else .f16, .k16 = if (is_tr) k16 else null, .n16 = if (is_tr) n16 else null });
+        }
+    }
+
+    /// A native linear's parts (Native): weight and scale bytes as stored (u8), or the bf16 weight.
+    fn native(b: *Builder, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, kind: Native) !void {
+        const parts: []const []const u8 = switch (kind) {
+            .fp8 => &.{ "w8", "s8" },
+            .fp4 => &.{ "w4", "s4" },
+            .nv4 => &.{ "w4", "t4" }, // NVFP4: the codes as MXFP4's, the E4M3 scales taken per 32 (checkpoint.zig)
+            .bf16 => &.{"bf"},
+        };
+        for (parts) |part| {
+            var buf: [256]u8 = undefined;
+            const key = try b.a.dupe(u8, try partKey(&buf, prefix, cols, rows, part));
+            try b.out.append(b.a, .{ .key = key, .dtype = if (kind == .bf16) .bf16 else .u8 });
         }
     }
 
@@ -218,8 +238,69 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     }
 }
 
+/// A native block (Format.native: DeepSeek's own release), the same split as `block`: FP8 attention, shared expert and
+/// Engram linears, MXFP4 routed experts, bf16 compressor, indexer keys, router and head; wo_a by group as FP8 (the
+/// loader keeps it in bf16, as DeepSeek's convert.py does).
+fn blockNative(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usize) !void {
+    const gl = s.groups(c);
+    for ([_][]const u8{ "hc_attn", "hc_ffn" }) |hc| for ([_][]const u8{ "fn", "scale", "base" }) |part| {
+        try b.plain(try b.fmt("{s}.{s}_{s}", .{ p, hc, part }), .f32);
+    };
+    try b.plain(try b.fmt("{s}.attn_norm.weight", .{p}), null);
+    try b.plain(try b.fmt("{s}.ffn_norm.weight", .{p}), null);
+    try b.native(try b.fmt("{s}.attn.wq_a", .{p}), null, null, .fp8);
+    try b.plain(try b.fmt("{s}.attn.q_norm.weight", .{p}), null);
+    try b.native(try b.fmt("{s}.attn.wq_b", .{p}), s.wqB(c), null, .fp8);
+    try b.native(try b.fmt("{s}.attn.wkv", .{p}), null, null, .fp8);
+    try b.plain(try b.fmt("{s}.attn.kv_norm.weight", .{p}), null);
+    try b.plain(try b.fmt("{s}.attn.attn_sink", .{p}), .f32);
+    const ga = s.woAGroups(c);
+    for (ga[0]..ga[0] + ga[1]) |g| try b.native(try b.fmt("{s}.attn.wo_a", .{p}), .{ g * c.o_lora, (g + 1) * c.o_lora }, null, .fp8);
+    try b.native(try b.fmt("{s}.attn.wo_b", .{p}), s.woBCols(c), s.range(gl * c.o_lora), .fp8);
+    if (c.kv_sources.has(i)) {
+        try b.native(try b.fmt("{s}.attn.compressor.wkv", .{p}), null, null, .bf16);
+        try b.plain(try b.fmt("{s}.attn.compressor.norm.weight", .{p}), null);
+        if (c.ratios[i] > 1) try b.native(try b.fmt("{s}.attn.compressor.wgate", .{p}), null, null, .bf16);
+    }
+    if (c.index_sources.has(i)) {
+        try b.native(try b.fmt("{s}.attn.indexer.wq_b", .{p}), null, null, .fp8);
+        try b.native(try b.fmt("{s}.attn.indexer.weights_proj", .{p}), null, null, .bf16);
+        if (c.kv_sources.has(i)) {
+            try b.native(try b.fmt("{s}.attn.indexer.wk", .{p}), null, null, .bf16);
+            try b.plain(try b.fmt("{s}.attn.indexer.k_norm.weight", .{p}), null);
+        }
+    }
+    try b.native(try b.fmt("{s}.ffn.gate", .{p}), null, null, .bf16);
+    try b.plain(try b.fmt("{s}.ffn.gate.bias", .{p}), .f32);
+    if (c.vision) try b.plain(try b.fmt("{s}.ffn.gate.bias_vl", .{p}), .f32);
+    const xp = s.expertParts(c);
+    for (0..experts + 1) |e| {
+        const shared = e == experts;
+        const ep = if (!shared) try b.fmt("{s}.ffn.experts.{d}", .{ p, e }) else try b.fmt("{s}.ffn.shared_experts", .{p});
+        const nv = !shared and c.nvfp4 and i < c.layers; // the DSpark stages stay MXFP4
+        const kind: Native = if (shared) .fp8 else if (nv) .nv4 else .fp4;
+        try b.native(try b.fmt("{s}.w1", .{ep}), xp.gu, null, kind);
+        try b.native(try b.fmt("{s}.w3", .{ep}), xp.gu, null, kind);
+        try b.native(try b.fmt("{s}.w2", .{ep}), xp.dcols, xp.half, kind);
+        if (nv) for ([_][]const u8{ "w1", "w3", "w2" }) |w| {
+            try b.plain(try b.fmt("{s}.{s}.input_scale", .{ ep, w }), .f32);
+            try b.plain(try b.fmt("{s}.{s}.weight_scale_2", .{ ep, w }), .f32);
+        };
+        if (xp.rest) |rc| if (restPair(e, experts) == s.pair.?) {
+            try b.native(try b.fmt("{s}.w1", .{ep}), rc, null, kind);
+            try b.native(try b.fmt("{s}.w3", .{ep}), rc, null, kind);
+        };
+    }
+    if (c.engram_layers.has(i)) {
+        try b.native(try b.fmt("{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)), .fp8);
+        try b.plain(try b.fmt("{s}.engram.q_weight", .{p}), .f32);
+        try b.plain(try b.fmt("{s}.engram.k_weight", .{p}), .f32);
+    }
+}
+
 /// Every tensor rank `s` loads, in load order (`dspark`: the DSpark stages and heads too). Keys live in `a`.
 pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
+    if (c.format == .native) return wantsNative(a, c, s, dspark);
     var b: Builder = .{ .a = a };
     try b.plain("embed.weight", null);
     try b.plain("norm.weight", null);
@@ -238,6 +319,64 @@ pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
         try b.plain(try b.fmt("{s}.confidence_head.proj.weight", .{last}), null);
     }
     return b.out.items;
+}
+
+/// wants for Format.native: the same order, native parts.
+fn wantsNative(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
+    var b: Builder = .{ .a = a };
+    try b.plain("embed.weight", null);
+    try b.plain("norm.weight", null);
+    try b.native("head", s.headCols(c), null, .bf16);
+    for (0..c.layers) |i| try blockNative(&b, c, s, try b.fmt("layers.{d}", .{i}), i, c.experts);
+    if (dspark and c.dspark_block > 0) {
+        const tp2: Split = .{ .rank = s.rank, .world = s.world };
+        for (0..c.draft_layers) |j| try blockNative(&b, c, tp2, try b.fmt("mtp.{d}", .{j}), c.layers + j, c.draft_experts);
+        const last = try b.fmt("mtp.{d}", .{c.draft_layers - 1});
+        try b.native("mtp.0.main_proj", null, null, .fp8);
+        try b.plain("mtp.0.main_norm.weight", null);
+        try b.plain(try b.fmt("{s}.norm.weight", .{last}), null);
+        try b.plain(try b.fmt("{s}.markov_head.embed.weight", .{last}), null);
+        try b.plain(try b.fmt("{s}.markov_head.head.weight", .{last}), null);
+        try b.plain(try b.fmt("{s}.confidence_head.proj.weight", .{last}), .f32);
+    }
+    return b.out.items;
+}
+
+test "a native rank's tensors: FP8 / FP4 / bf16 parts with the split's ranges" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = @import("config.zig");
+    var why: cfg.Why = .{};
+    var c = try cfg.parse(a, cfg.test_config, &why);
+    c.format = .native;
+    const w = try wants(a, c, .{ .rank = 0, .world = 2, .pair = 1, .parity = true }, true);
+    const expect = [_][]const u8{
+        "head|(32384, 64640)|None|bf",
+        "layers.0.attn.wq_b|(8192, 16384)|None|w8",
+        "layers.0.attn.wq_b|(8192, 16384)|None|s8",
+        "layers.0.attn.wo_a|(2048, 3072)|None|w8",
+        "layers.0.attn.wo_a|(3072, 4096)|None|s8",
+        "layers.0.attn.wo_b|(2560, 5120)|(0, 4096)|w8",
+        "layers.0.ffn.gate|None|None|bf",
+        "layers.0.ffn.experts.0.w1|(512, 1024)|None|w4",
+        "layers.0.ffn.experts.1.w1|(1024, 1152)|None|s4",
+        "layers.0.ffn.experts.0.w2|(2560, 5120)|(0, 1152)|w4",
+        "layers.0.ffn.shared_experts.w3|(1024, 1152)|None|w8",
+        "layers.1.engram.wkv|(12800, 25600)|(0, 3072)|w8",
+        "layers.2.attn.compressor.wgate|None|None|bf",
+        "mtp.0.attn.wq_b|(0, 16384)|None|w8",
+        "mtp.0.main_proj|None|None|s8",
+        "mtp.2.confidence_head.proj.weight|torch.float32",
+    };
+    for (expect) |k| {
+        var found = false;
+        for (w) |x| found = found or std.mem.eql(u8, x.key, k);
+        if (!found) std.debug.print("missing {s}\n", .{k});
+        try std.testing.expect(found);
+    }
+    // the rest block only for this pair's parity (pair 1: odd experts and the shared one)
+    for (w) |x| try std.testing.expect(!std.mem.eql(u8, x.key, "layers.0.ffn.experts.0.w1|(1024, 1152)|None|w4"));
 }
 
 test "a rank's tensors in load order: the split's ranges, keys as Python prints them" {

@@ -20,6 +20,9 @@ pub const Model = struct {
     speculate_early: bool = true, // draft every row's first draft behind the verify
     draft_prior: []const f64 = &.{}, // the head's acceptance by depth until a stream has its own
     plain_guard: bool = false, // plain rounds compete with drafted depths
+    prepass: bool = false, // streams join the next head pass only where it pays (depth.Rule.prepassSelect)
+    pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams
+    draft_row_ms: f64 = 0.0, // A3: a draft row's ms apart from the streams' rows (0: shared_costs by total rows)
     drafts: u32 = 1, // head drafts a round at most
     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
@@ -43,6 +46,9 @@ pub const Config = struct {
     speculate_early: bool,
     pipelined: bool,
     plain_guard: bool,
+    prepass: bool = false,
+    pass_ms: [2]f64 = .{ 0, 0 },
+    draft_row_ms: f64 = 0.0,
     most_drafts: u32,
     family_streams: bool,
     batch_rows: u32,
@@ -104,6 +110,9 @@ pub const Config = struct {
             .speculate_early = m.speculate_early,
             .pipelined = m.gpu_tokens,
             .plain_guard = m.plain_guard,
+            .prepass = m.prepass,
+            .pass_ms = m.pass_ms,
+            .draft_row_ms = m.draft_row_ms,
             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
             .family_streams = streams,
             .batch_rows = batch_rows,

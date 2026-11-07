@@ -29,6 +29,13 @@ pub const Link = struct {
 
     /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
     pub fn listen(ip: [4]u8, port: u16) !Link {
+        var p = try Ports.open(&.{ip}, port);
+        defer p.close();
+        return p.accept(1);
+    }
+
+    /// A socket bound to `ip`:`port` and listening (a backlog of one: the port is one peer's).
+    fn bound(ip: [4]u8, port: u16) !c.fd_t {
         const fd = try socket();
         errdefer _ = c.close(fd);
         const one: c_int = 1;
@@ -36,11 +43,7 @@ pub const Link = struct {
         var a = addr(ip, port);
         if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
         if (c.listen(fd, 1) != 0) return error.ListenFailed;
-        const peer = c.accept(fd, null, null);
-        if (peer < 0) return error.AcceptFailed;
-        _ = c.close(fd);
-        tune(peer);
-        return .{ .fd = peer };
+        return fd;
     }
 
     /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
@@ -141,6 +144,40 @@ pub const Link = struct {
     }
 };
 
+/// Rank 0's ports for its followers: follower g's (g = 1 to n) is `port + g - 1` on `ips[g - 1]`. All of them listen
+/// from `open` on, so a follower that is ready early connects into its port's backlog (the kernel completes the
+/// handshake) and waits there while rank 0 loads its weights or takes the followers before it.
+pub const Ports = struct {
+    fds: [3]c.fd_t = .{ -1, -1, -1 },
+
+    pub fn open(ips: []const [4]u8, port: u16) !Ports {
+        if (ips.len > 3) return error.TooManyFollowers;
+        var p: Ports = .{};
+        errdefer p.close();
+        for (ips, 0..) |ip, i| p.fds[i] = try Link.bound(ip, port + @as(u16, @intCast(i)));
+        return p;
+    }
+
+    /// Follower g's link (g from 1): its connection, waited for if it has not come yet; its port then closes.
+    pub fn accept(p: *Ports, g: usize) !Link {
+        const fd = p.fds[g - 1];
+        if (fd < 0) return error.NoSuchFollower;
+        const peer = c.accept(fd, null, null);
+        if (peer < 0) return error.AcceptFailed;
+        _ = c.close(fd);
+        p.fds[g - 1] = -1;
+        Link.tune(peer);
+        return .{ .fd = peer };
+    }
+
+    pub fn close(p: *Ports) void {
+        for (&p.fds) |*fd| if (fd.* >= 0) {
+            _ = c.close(fd.*);
+            fd.* = -1;
+        };
+    }
+};
+
 /// "192.0.2.7" as four bytes.
 pub fn parseIp(text: []const u8) ![4]u8 {
     var out: [4]u8 = undefined;
@@ -177,4 +214,38 @@ test "frames cross a loopback link in order" {
     try std.testing.expectEqualStrings("polled", try l.recvSpin(&buf, 1000 * std.time.ns_per_ms));
     try std.testing.expectEqualStrings("late", try l.recvSpin(&buf, 0));
     t.join();
+}
+
+test "followers that are ready first wait in their ports' backlogs" {
+    // followers 3, 2 and 1 connect in that order, each giving up after a second, before rank 0 takes any of them:
+    // with one port listening at a time (each opened after the follower before it was in), 3 and 2 would give up
+    const io = std.testing.io;
+    const lo: [4]u8 = .{ 127, 0, 0, 1 };
+    const port: u16 = 29600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 300)));
+    var ports = try Ports.open(&.{ lo, lo, lo }, port);
+    defer ports.close();
+    const Follower = struct {
+        fn run(p: u16, g: u8, out: *?Link) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p + g - 1, 1) catch return;
+            l.send(&.{g}) catch {
+                l.close();
+                return;
+            };
+            out.* = l;
+        }
+    };
+    var theirs: [3]?Link = .{ null, null, null };
+    defer for (&theirs) |*l| if (l.*) |*x| x.close();
+    for ([_]u8{ 3, 2, 1 }) |g| {
+        const t = try std.Thread.spawn(.{}, Follower.run, .{ port, g, &theirs[g - 1] });
+        t.join();
+    }
+    for (theirs) |l| try std.testing.expect(l != null);
+    var buf: [4]u8 = undefined;
+    for (1..4) |g| {
+        var l = try ports.accept(g);
+        defer l.close();
+        try std.testing.expectEqualSlices(u8, &.{@as(u8, @intCast(g))}, try l.recv(&buf));
+    }
+    try std.testing.expectError(error.NoSuchFollower, ports.accept(1));
 }

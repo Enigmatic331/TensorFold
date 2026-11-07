@@ -21,6 +21,7 @@ const tri_norm = @import("tri_norm.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
+const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const round2d = @import("round2d.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
@@ -312,6 +313,10 @@ pub const Round = struct {
         // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
         rd.wo_suh = try gpa.alloc(u64, w.layers.len);
         for (w.layers, 0..) |lay, li| {
+            if (e.mx != null) { // Format.native: no rotations
+                rd.wo_suh[li] = 0;
+                continue;
+            }
             var k: usize = 0;
             for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
             const dst = try a.take(k * 2);
@@ -425,6 +430,17 @@ pub const Round = struct {
         rd.pf_out = true;
     }
 
+    /// The active experts' down weights into L2 beside the main stream (mx.prefetchDown), as prefetch forks.
+    fn prefetchDown(rd: *Round, e: *const Engine, k: *const mx.Kernels, ex: weights.Experts, sc: mx.ExpertScratch, budget: u64) !void {
+        const s = rd.pf orelse return;
+        if (budget == 0) return;
+        try rd.pf_fork.?.record(e.s);
+        try s.wait(rd.pf_fork.?);
+        try mx.prefetchDown(k, s, ex, sc, budget);
+        try rd.pf_join.?.record(s);
+        rd.pf_out = true;
+    }
+
     /// The main stream waits for the prefetches forked so far (a stretch ends joined: its graph's every stream).
     fn joinPrefetch(rd: *Round, e: *const Engine) !void {
         if (!rd.pf_out) return;
@@ -451,6 +467,18 @@ pub const Round = struct {
             try rd.clock(e, @intFromEnum(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
+    }
+
+    /// After a capture that did not complete (G0.3): the side and prefetch forks it recorded went with it, so nothing is
+    /// outstanding; a side stream still capturing (its capture sequence not ended with the main stream's) is logged.
+    fn abortCapture(rd: *Round, e: *const Engine) void {
+        rd.side_out = false;
+        rd.pf_out = false;
+        _ = e;
+        for ([_]?cuda.Stream{ rd.side, rd.pf, rd.par }) |os| if (os) |st| {
+            const status = cuda.graph.captureStatus(st) catch continue;
+            if (status != .none) std.log.err("a side stream is still in a stream capture after a failed capture ({s})", .{@tagName(status)});
+        };
     }
 
     /// The main stream waits for the side work forked so far.
@@ -572,7 +600,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         }
         const xs = [_]u64{ rd.x, rd.x, rd.x, rd.x };
         const ldxs = [_]usize{ c.hidden, c.hidden, c.hidden, c.hidden };
-        try prompt.grouped(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
+        try prompt.groupedDecode(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
     }
     try rd.mark(e, .a_in);
     // the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores
@@ -582,7 +610,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     const need_iq = has_idx and !idx_all;
     // q_proj with kv (rot_q): q's RMSNorm writes wq_b's (and the indexer wq_b's) rotated rows and the window KV into
     // the ring in one launch; wq_b's epilogue applies q's RoPE
-    {
+    if (e.mx != null) {
+        // Format.native: q's RMSNorm and the window KV (RMSNorm, RoPE, FP8 quant-dequant into the ring) as plain rows,
+        // then wq_b (and the indexer's wq_b) on them and q's RoPE (Attention.forward)
+        try tri_basic.rmsnorm(t, rd.qa, lay.wq_a.n, lay.q_norm, rd.qr, lay.wq_a.n, c.eps, R, lay.wq_a.n);
+        try tri_norm.kvNormRope(t, rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), c.eps, true, rd_dim, rd.kout, R, hd);
+        if (need_iq) {
+            try prompt.groupedDecode(e, ch, R, &.{ lay.wq_b, lay.idx_wq_b.? }, &.{ rd.qr, rd.qr }, &.{ lay.wq_a.n, lay.wq_a.n }, &.{ rd.q, rd.iq }, &.{ lay.wq_b.n, lay.idx_wq_b.?.n }, &.{ .bf16, .bf16 });
+        } else try prompt.groupedDecode(e, ch, R, &.{lay.wq_b}, &.{rd.qr}, &.{lay.wq_a.n}, &.{rd.q}, &.{lay.wq_b.n}, &.{.bf16});
+        try tri_norm.ropeHeads(t, rd.q, rope.cos, rope.sin, pos, rd_dim, false, R, hl, hd);
+    } else {
         var rot: [2]tri_norm.Rot = undefined;
         var calls: [2]exl3_linear.Call = undefined;
         var n: usize = 0;
@@ -602,7 +639,8 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     // the prefetch: this layer's wo_a and wo_b behind q's linears
     {
         var r: [5][2]u64 = @splat(.{ 0, 0 });
-        for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
+        const w8: ?weights.Linear = if (e.mx) |mk| (if (mk.dec_on) lay.wo_a8 else null) else null;
+        if (w8) |x| r[0] = linearBytes(x) else for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         r[4] = linearBytes(lay.wo_b);
         if (l2_skip & 1 == 0) try rd.prefetch(e, &r, l2_mb[0] << 20);
     }
@@ -632,7 +670,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             const gpos = rd.g(if (ratio == 1) .gpos1 else .gpos2);
             if (lay.idx_wk) |iwk| {
                 const id = c.index_head_dim;
-                try prompt.grouped(e, ch, R, &.{iwk}, &.{rd.lat}, &.{hd}, &.{rd.ikp}, &.{id}, &.{.bf16});
+                try prompt.groupedDecode(e, ch, R, &.{iwk}, &.{rd.lat}, &.{hd}, &.{rd.ikp}, &.{id}, &.{.bf16});
                 try tri_basic.rmsnorm(t, rd.ikp, id, lay.idx_k_norm, rd.ik, id, c.eps, R, id);
                 try tri_norm.ropeHeads(t, rd.ik, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, id);
                 try tri_attn.fp4Store(t, rd.ik, id, cs.idx_codes[li], cs.idx_scales[li], ctarget, R, id, 32, false);
@@ -655,7 +693,9 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
             try tri_norm.ropeHeads(t, rd.iq, rope.cos, rope.sin, pos, rd_dim, false, R, ih, id);
             try tri_attn.fp4QdP2(t, rd.iq, rd.iq4, R * ih * id);
-            try tri_norm.rowmmWts(t, rd.x, c.hidden, lay.idx_proj_h, exact.indexScale(c.index_head_dim, c.index_heads), rd.iw, R, c.hidden, ih);
+            if (e.mx) |mk| {
+                try mx.bf16Gemm(mk, e.s, rd.x, c.hidden, lay.idx_proj, c.hidden, R, ih, c.hidden, rd.iw, ih, .bf16, exact.indexScale(c.index_head_dim, c.index_heads), true, 1, 0, 0, 0, ch.mxe.z);
+            } else try tri_norm.rowmmWts(t, rd.x, c.hidden, lay.idx_proj_h, exact.indexScale(c.index_head_dim, c.index_heads), rd.iw, R, c.hidden, ih);
             const kk = @min(c.index_topk, nb);
             const pow2 = kk & (kk - 1) == 0;
             const after_src = c.candidate_source < li;
@@ -731,12 +771,36 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .wbase = rd.g(.wbase),
         .cbase = cbase,
         .ring_rows = ring_rows,
-        .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
+        .rot = if (e.mx != null) null else .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
     });
     try rd.mark(e, .a_core);
-    var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     const uw = lay.groups * lay.wo_a[0].n;
+    if (e.mx) |k| {
+        // Format.native: the inverse RoPE on o, wo_a's groups (o quant-dequantized, bf16 einsum), then wo_b on the
+        // rank's whole wo_a output (2D: the column partner's groups first, as on the prompt path)
+        try tri_norm.ropeHeads(t, rd.o, rope.cos, rope.sin, pos, rd_dim, true, R, hl, hd);
+        if (if (k.dec_on) lay.wo_a8 else null) |w8| {
+            try mx.woA8(k, e.s, ch.mxs, w8, lay.groups, rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
+        } else try mx.woA(k, e.s, ch.mxs, lay.wo_a[0..lay.groups], rd.o, hl * hd, R, rd.u, uw, ch.mxe.z);
+        try rd.mark(e, .a_woa);
+        var u = rd.u;
+        var uk: usize = uw;
+        if (e.two) |tw| {
+            try tw.catRank(e, rd.u, tw.u_full, R, tw.uw, 2);
+            u = tw.u_full;
+            uk = tw.uw[0] + tw.uw[1];
+        }
+        try rd.mark(e, .a_x);
+        try prompt.groupedDecode(e, ch, R, &.{lay.wo_b}, &.{u}, &.{uk}, &.{rd.pa}, &.{lay.wo_b.n}, &.{.f32});
+        // (the decode tensor-core kernels: the shared expert's gate / up too, read first by gate / up, during the
+        // attention's gather)
+        if (k.dec_on) {
+            if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up }, (l2_mb[1] + l2_dec_mb) << 20);
+        } else if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 } }, l2_mb[1] << 20);
+        return;
+    }
+    var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     var col: usize = 0;
     var off: usize = 0;
     for (lay.wo_a[0..lay.groups], 0..) |wo, gi| {
@@ -762,6 +826,27 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const c = e.c;
     const R = rd.r;
     const sl = e.slots();
+    if (e.mx) |k| {
+        // Format.native: Gate.forward's fp32 logits (bf16 rows and weight), the routing, the experts
+        try mx.bf16Gemm(k, e.s, rd.x, c.hidden, lay.gate_w, c.hidden, R, c.experts, c.hidden, rd.gl, c.experts, .f32, 1, false, 1, 0, 0, 0, ch.mxe.z);
+        try tri_norm.route(e.t, rd.gl, 0, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+        try rd.mark(e, .m_rt);
+        if (e.two) |tw| {
+            // prompt2d.expertsNative's steps, the profile's marks between: gate / up, the packs' exchange, down
+            const ex = lay.experts;
+            try mx.gateUp(k, e.s, e.d, ex, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, ex.width, true);
+            try rd.mark(e, .m_gu);
+            if (k.dec_on and l2_skip & 8 == 0) try rd.prefetchDown(e, k, ex, ch.mxe, l2_dn_mb << 20);
+            if (tw.ir != 0) try tw.assembleParity(e, ex, ch.xsd.xd, rd.pick, R * ch.mxe.slots) else try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.mxe.slots, tw.gu, 2);
+            try rd.mark(e, .m_x);
+            try mx.down(k, e.s, ex, ch.mxe, tw.xd_full, ex.down_k, rd.pick, R, rd.pm, tw.dw[tw.p], false, true);
+        } else {
+            try mx.gateUp(k, e.s, e.d, lay.experts, ch.mxe, rd.x, c.hidden, rd.pick, rd.mw, R, c.swiglu_limit, ch.xsd.xd, lay.experts.width, true);
+            try mx.down(k, e.s, lay.experts, ch.mxe, ch.xsd.xd, lay.experts.width, rd.pick, R, rd.pm, c.hidden, false, true);
+        }
+        try rd.mark(e, .m_gu);
+        return prefetchNext(e, rd, li);
+    }
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     try rd.mark(e, .m_rt);
@@ -784,8 +869,13 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
         try rd.mark(e, .m_x);
         try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
     } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
-    // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
-    // 4 MiB of its wkv), after the last layer the head
+    try prefetchNext(e, rd, li);
+}
+
+/// The prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
+/// 4 MiB of its wkv), after the last layer the head.
+fn prefetchNext(e: *const Engine, rd: *Round, li: usize) !void {
+    const c = e.c;
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
         if (nx.engram_wkv) |ew| {
@@ -796,9 +886,16 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, l2_mb[2] << 20);
 }
 
-/// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
+/// A linear's weight bytes: their first byte and length (EXL3: k * n values of k2 / 2 bits; native: FP8 a byte, MXFP4
+/// half one, bf16 two, a value).
 fn linearBytes(l: weights.Linear) [2]u64 {
-    return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
+    const kn = @as(u64, l.k) * l.n;
+    return switch (l.fmt) {
+        .exl3 => .{ l.words, kn * l.k2 / 16 },
+        .fp8 => .{ l.w, kn },
+        .fp4 => .{ l.w, kn / 2 },
+        .bf16 => .{ l.w, kn * 2 },
+    };
 }
 
 
@@ -809,6 +906,10 @@ pub var l2_skip: u8 = 0;
 /// The forks' MiB (the served L2_ATTN_MB, L2_MOE_MB, L2_NEXT_MB and L2_STRETCH_END_MB: 16, 8, 16, 4; TF_DS_L2_ATTN_MB,
 /// TF_DS_L2_MOE_MB, TF_DS_L2_NEXT_MB, TF_DS_L2_STRETCH_END_MB at Model.open).
 pub var l2_mb: [4]u64 = .{ 16, 8, 16, 4 };
+/// The MiB the native decode path adds to the second prefetch (the shared expert's gate / up; TF_DS_L2_DEC_MB).
+pub var l2_dec_mb: u64 = 8;
+/// The MiB of the active experts' down weights prefetched beside the 2D exchange (TF_DS_L2_DN_MB; 0: none).
+pub var l2_dn_mb: u64 = 8;
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
 fn hcFnBytes(c: anytype) u64 {
@@ -886,6 +987,7 @@ const Carry = struct {
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+    captures: u64 = 0, // captures attempted (TF_DS_GRAPH_FAIL_TEST counts them)
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
@@ -917,19 +1019,68 @@ pub const Graphs = struct {
             return;
         }
         const start = cy.*;
-        try cuda.graph.beginCapture(e.s, .thread_local);
-        stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
+        // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
+        // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
+        // others waiting in them for good. Every rank now captures and instantiates (the map's room for the new key
+        // reserved first, so nothing can fail after the vote), then all agree on the outcome before any launches: one
+        // failure anywhere fails the stretch, and so the round, on every rank.
+        var failed: ?anyerror = null;
+        var exec_got: ?cuda.graph.Exec = null;
+        // the map's room first, agreed before anyone records: NCCL needs every rank to capture the same collectives
+        // (a rank that skipped the capture would leave the others' recorded exchanges unmatched)
+        const room = g.map.ensureUnusedCapacity(g.gpa, 1);
+        if (!try e.agreeAll(if (room) |_| true else |_| false)) {
+            try room;
+            return error.GraphCaptureFailed;
+        }
+        capture: {
+            cuda.graph.beginCapture(e.s, .thread_local) catch |err| {
+                failed = err;
+                break :capture;
+            };
+            stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
+                if (cuda.graph.endCapture(e.s)) |got| {
+                    var x = got;
+                    x.deinit();
+                } else |_| {}
+                failed = err;
+                break :capture;
+            };
+            var graph = cuda.graph.endCapture(e.s) catch |err| {
+                failed = err;
+                break :capture;
+            };
+            defer graph.deinit();
+            exec_got = graph.instantiate() catch |err| {
+                failed = err;
+                break :capture;
+            };
+        }
+        g.captures += 1;
+        if (failed == null and prompt.injectedCaptureFailure(.round, e.comm.rank, g.captures)) {
+            if (exec_got) |*x| x.deinit();
+            exec_got = null;
+            failed = error.GraphInjectedFailure;
+        }
+        // a capture cut short leaves the side and prefetch streams' forks marked outstanding: their work was discarded
+        // with the capture, so the next stretch must not wait on events recorded in it
+        if (failed != null) rd.abortCapture(e);
+        const all_ok = e.agreeAll(failed == null) catch |err| {
+            if (exec_got) |*x| x.deinit();
             return err;
         };
-        var graph = try cuda.graph.endCapture(e.s);
-        defer graph.deinit();
-        var exec = try graph.instantiate();
-        errdefer exec.deinit();
-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
+        if (!all_ok) {
+            if (exec_got) |*x| x.deinit();
+            if (failed) |err| {
+                std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on rank {d}: {s}; the round fails on every rank", .{ key.rows, key.bucket, key.stretch, e.comm.rank, @errorName(err) });
+                return err;
+            }
+            std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the round fails on every rank", .{ key.rows, key.bucket, key.stretch });
+            return error.GraphCaptureFailed;
+        }
+        const exec = exec_got.?;
+        // The cache owns exec from here, including when the first launch fails.
+        g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = cy.* });
         try exec.launchOn(e.s);
     }
 };
@@ -959,6 +1110,10 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
     var ah: Ahead = .{};
     var ahead = e.c.engram_layers.slice().len == 0;
+    // a round that fails between submitting its Engram reads and landing them (a failed stretch, G0.3) drains the
+    // reads still in flight, so the next round's reads cannot meet them in the staging buffers or the batch ids
+    var landed: [2]bool = .{ false, false };
+    errdefer if (eh) |x| drainAhead(e, x, &ah, landed); // (slots never submitted: ids 0, batch 0, nothing to wait)
     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
     var sn: u32 = 0;
@@ -971,6 +1126,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
             ahead = true;
             try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
+            if (std.mem.indexOfScalar(u16, e.c.engram_layers.slice(), @intCast(li))) |j| landed[j] = true;
         }
         try rd.clock(e, Round.clock_wait);
         if (graphs) |g| {
@@ -1015,7 +1171,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
                 try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
                 pending = null;
             }
-            try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
+            try prompt.groupedDecode(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
             try Probe.check(probe, .engram_proj, l, rd.ek);
             const en = if (e.two) |tw| tw.engramWidth() else ew.n;
             if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
@@ -1064,7 +1220,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
     try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
     const hn: usize = w.head.n;
-    try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
+    try prompt.groupedDecode(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
     const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
     if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
@@ -1097,6 +1253,20 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
 /// go out at the round's start, else each layer's when its stretch comes (the reader pool).
 const Ahead = struct { ids: [2]u64 = .{ 0, 0 }, aio: bool = false, R: usize = 0 };
 
+/// The round's Engram reads not yet landed (slots j with landed[j] false) waited for and dropped (G0.3: a round that
+/// failed after engramAhead). Errors are ignored: the round has failed already.
+fn drainAhead(e: *const Engine, eh: *prompt.EngramHost, ah: *const Ahead, landed: [2]bool) void {
+    const n = @min(e.c.engram_layers.slice().len, 2);
+    for (0..n) |j| {
+        if (landed[j]) continue;
+        if (eh.pk) |pr| {
+            pr.roundDrain(j);
+        } else if (ah.aio) {
+            if (eh.aio) |aio| aio.wait(ah.ids[j]) catch {};
+        }
+    }
+}
+
 /// Layer slot j's first row in the Engram host's buffers (a round's rows of each Engram layer apart).
 fn aheadRow(j: usize) usize {
     return j * max_rows;
@@ -1118,6 +1288,12 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
         eh.hasher.hashes(w.seq, start, w.n, eh.hashes[w.row * per .. (w.row + w.n) * per]);
     }
     ah.* = .{ .aio = eh.aio != null, .R = R };
+    if (eh.pk) |pr| {
+        // packed shards: each layer's records staged now, their misses submitted (engram_rows.zig)
+        for (0..c.engram_layers.slice().len) |j| try pr.roundAhead(j, eh.hashes[0 .. R * eh.hasher.layers * cols], R, eh.hasher.layers);
+        if (eh.io != null) eh.t_hash += stamp(eh) - t0;
+        return;
+    }
     for (c.engram_layers.slice(), 0..) |li, j| {
         const tbl = eh.tables.layers.get(li) orelse return error.MissingEngramTable;
         const f0 = aheadRow(j) * k;
@@ -1135,6 +1311,16 @@ fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows:
 fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const Ahead, li: usize) !void {
     const c = e.c;
     const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
+    if (eh.pk) |pr| {
+        // packed shards: landed (a host step on the stream in stream mode), uploaded, combined, decoded into rd.e_in
+        const tp = stamp(eh);
+        try pr.roundLand(j, ah.R, e.comm, e.s, rd.e_in);
+        if (eh.io != null) {
+            eh.t_read += stamp(eh) - tp;
+            eh.calls += 1;
+        }
+        return;
+    }
     const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const k = eh.hi - eh.lo;
     const f0 = aheadRow(j) * k;
@@ -1146,9 +1332,10 @@ fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const A
     const t2 = stamp(eh);
     const w0 = f0 * tbl.row_w;
     const s0 = f0 * tbl.row_s;
-    for (0..m) |i| engram.decodeRow(eh.w[w0 + i * tbl.row_w ..][0..tbl.row_w], eh.s[s0 + i * tbl.row_s ..][0..tbl.row_s], eh.rows[w0 + i * tbl.row_w ..][0..tbl.row_w]);
+    const d0 = f0 * tbl.dim();
+    for (0..m) |i| engram.decodeRow(eh.w[w0 + i * tbl.row_w ..][0..tbl.row_w], eh.s[s0 + i * tbl.row_s ..][0..tbl.row_s], eh.rows[d0 + i * tbl.dim() ..][0..tbl.dim()]);
     const t3 = stamp(eh);
-    try prompt.upload(e, rd.e_in, eh.rows[w0..].ptr, m * tbl.row_w * 2);
+    try prompt.upload(e, rd.e_in, eh.rows[d0..].ptr, m * tbl.dim() * 2);
     if (eh.io != null) {
         eh.t_read += t2 - t1;
         eh.t_decode += t3 - t2;

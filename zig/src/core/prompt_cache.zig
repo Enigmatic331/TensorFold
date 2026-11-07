@@ -51,12 +51,32 @@ pub const Rules = struct {
 pub const Entry = struct {
     tokens: []u32, // the state's tokens and `lookahead` more
     at: u32,
+    images: u64 = 0, // the images key of the tokens before `at` (0: none, the tokens alone decide)
     saved: Saved,
     bytes: u64,
     born: u32, // the length of the prompt that kept it: a later turn's is longer
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+};
+
+/// What a kept state depends on beyond its tokens: the images inside its prefix. An image's positions hold only its
+/// placeholder's token, so two prompts with the same tokens but different pictures must not share a state.
+pub const Images = struct {
+    ctx: ?*const anyopaque = null,
+    /// The key of the images in a prompt's `[0, at)`: 0 when it holds none (the tokens alone decide, as before).
+    hash: *const fn (ctx: ?*const anyopaque, at: u32) u64 = noImages,
+    /// No images: every prefix keys to 0, so the tokens alone decide.
+    pub const none: @This() = .{};
+
+    /// The key of the images in a prompt's `[0, at)`.
+    pub fn key(im: Images, at: u32) u64 {
+        return im.hash(im.ctx, at);
+    }
+
+    fn noImages(_: ?*const anyopaque, _: u32) u64 {
+        return 0;
+    }
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -122,10 +142,16 @@ pub const Store = struct {
 
     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+        return s.findKeyed(prompt, starts, .none);
+    }
+
+    /// `find` for a prompt with images: a kept state also matches only if it holds the same images in its prefix.
+    pub fn findKeyed(s: *Store, prompt: []const u32, starts: []const u32, images: Images) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
             if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
+            if (e.images != images.key(e.at)) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
             best = e;
@@ -149,7 +175,12 @@ pub const Store = struct {
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
-        const e = s.recall(prompt, starts, s.find(prompt, starts));
+        return s.lookupKeyed(a, prompt, history_len, shared, starts, .none);
+    }
+
+    /// `lookup` for a prompt with images: the states it resumes and keeps are keyed by its images as well.
+    pub fn lookupKeyed(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, images: Images) !Lookup {
+        const e = s.recall(prompt, starts, s.findKeyed(prompt, starts, images), images);
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
@@ -249,11 +280,17 @@ pub const Store = struct {
 
     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
+        return s.keepKeyed(prompt, at, owner, starts, .none);
+    }
+
+    /// `keep` for a prompt with images: the state is keyed by its images too, and a state with images is never learned.
+    pub fn keepKeyed(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, images: Images) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
+        const key = images.key(at);
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+        for (s.entries.items) |e| if (e.at == at and e.images == key and std.mem.eql(u32, e.tokens, prompt[0..n])) {
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
             return true;
@@ -293,14 +330,14 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .at = at, .images = key, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
         s.entries.append(s.gpa, e) catch {
             s.free(e);
             return s.fail(at, error.OutOfMemory);
         };
         s.held += charged;
         s.counts.kept += 1;
-        if (shared) s.learn(e, starts);
+        if (shared and key == 0) s.learn(e, starts); // a learned state is found by its tokens alone: image-free cuts only
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;
     }
@@ -324,10 +361,11 @@ pub const Store = struct {
     }
 
     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
-    fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
+    fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry, images: Images) ?*Entry {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+        if (images.key(m.at) != 0) return have; // a learned state was kept for a prefix without images
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
             s.remove(s.victimBut(have, prompt) orelse return have);
@@ -335,7 +373,7 @@ pub const Store = struct {
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
-        e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
+        e.* = .{ .tokens = &.{}, .at = m.at, .images = 0, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
         const key = m.key;

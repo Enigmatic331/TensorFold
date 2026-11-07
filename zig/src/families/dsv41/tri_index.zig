@@ -15,7 +15,10 @@ pub const tile = 64;
 /// kernels.TOPK_FUSED_MAX (TF_DS_TOPK_FUSED_MAX unset): keys a row the fused selection takes at most.
 pub const topk_fused_max = 4096;
 /// kernels.IDX_RB with IDX_TREE on (TF_DS_IDX_TREE / TF_DS_IDX_RB unset): prompt chunks' scores one row a program.
-const idx_rb = 1;
+/// WP6 (docs/prefill-plan.md): the kit's own `_index_score_rows` is already captured at RB=2 (dequantizing a
+/// 64-key tile once for 2 rows instead of 1; TF_DS_IDX_RB=2 set once at startup, model.zig), but not at RB=1's
+/// "TREE" constexpr -- the matching capture simply has no TREE entry, so the call below only asks for it at RB=1.
+pub var idx_rb: usize = 1;
 /// What topk_select_pruned's `every` holds in each row: a visible count past every tile position.
 pub const every_vis: i64 = 1 << 40;
 
@@ -83,14 +86,22 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
         });
     }
     std.debug.assert(base == null);
-    try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &.{
+    const rb_args = [_]aot.Arg{
         p("Q", "*bf16", q),    p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
         p("VIS", "*i64", vis), p("OUT", ot, out),         int("n", n),                 int("rows", rows),
         tm,                    int("nt", nt),
-    }, &.{
-        ci("IH", ih),     ci("ID", id),                          ci("BN", tile),   ci("RB", idx_rb), cb("PACKED", k == .fp4),
-        cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys), cb("TREE", true),
-    });
+    };
+    const rb_base_consts = [_]aot.Const{
+        ci("IH", ih),     ci("ID", id),                          ci("BN", tile),   ci("RB", idx_rb),
+        cb("PACKED", k == .fp4), cb("KEYS", keys), cb("HAS_TMAX", tmax != null and keys),
+    };
+    // RB=1 is the only row count the kit captured with a "TREE" constexpr at all; every RB=2 capture has no
+    // TREE entry, so asking for one there (aot.Set.find requires an exact name match) would always miss.
+    if (idx_rb == 1) {
+        try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &rb_args, &(rb_base_consts ++ [_]aot.Const{cb("TREE", true)}));
+    } else {
+        try t.run("_index_score_rows", .{ tri.cdiv(rows, idx_rb), nt, 1 }, &rb_args, &rb_base_consts);
+    }
 }
 
 /// index_keys: index_score's int64 keys (decode windows), apply_candidates' mask folded in; pruned_k: topk_select_pruned's k.

@@ -125,8 +125,9 @@ pub const Hasher = struct {
 };
 
 /// One row's FP8 E4M3 values times their E8M0 scale (one a 32) rounded to bf16, as Engram._decode does on the GPU:
-/// the value exactly in fp32, times 2^(scale - 127), then round to nearest even.
+/// the value exactly in fp32, times 2^(scale - 127), then round to nearest even. `w` half of `out`: NVIDIA's MXFP4 row.
 pub fn decodeRow(w: []const u8, s: []const u8, out: []u16) void {
+    if (w.len * 2 == out.len) return decodeRowFp4(w, s, out);
     // the same products: each byte's value from a table of e4m3, each 32's scale once
     var i: usize = 0;
     while (i < w.len) : (i += 32) {
@@ -135,6 +136,23 @@ pub fn decodeRow(w: []const u8, s: []const u8, out: []u16) void {
         for (w[i..end], out[i..end]) |b, *o| o.* = bf16(e4m3_table[b] * p);
     }
 }
+
+/// One MXFP4 row: E2M1 codes two a byte, the even column in the low nibble (vllm-project/vllm#61530's reading of the
+/// checkpoint, Zhehao Hu), times their E8M0 scale (one a 32 values). Every product is exact in bf16 but past its range.
+fn decodeRowFp4(w: []const u8, s: []const u8, out: []u16) void {
+    var i: usize = 0;
+    while (i < w.len) : (i += 16) {
+        const p = pow2(@as(i32, s[i / 16]) - 127);
+        const end = @min(w.len, i + 16);
+        for (w[i..end], i..) |b, at| {
+            out[2 * at] = bf16(e2m1_table[b & 0xf] * p);
+            out[2 * at + 1] = bf16(e2m1_table[b >> 4] * p);
+        }
+    }
+}
+
+/// E2M1 of every nibble.
+const e2m1_table = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
 
 /// e4m3 of every byte.
 const e4m3_table: [256]f32 = blk: {
@@ -149,7 +167,8 @@ const e4m3_table: [256]f32 = blk: {
 pub fn decodeRows(w: []const u8, s: []const u8, out: []u16, m: usize, row_w: usize, row_s: usize, threads: usize) void {
     const Part = struct {
         fn run(pw: []const u8, ps: []const u8, po: []u16, lo: usize, hi: usize, rw: usize, rs: usize) void {
-            for (lo..hi) |i| decodeRow(pw[i * rw ..][0..rw], ps[i * rs ..][0..rs], po[i * rw ..][0..rw]);
+            const rd = if (rw * 2 == rs * 32) rw * 2 else rw; // MXFP4: two values a byte
+            for (lo..hi) |i| decodeRow(pw[i * rw ..][0..rw], ps[i * rs ..][0..rs], po[i * rd ..][0..rd]);
         }
     };
     const n = if (m * row_w < 1 << 20) 1 else @min(threads, max_decode_threads);
@@ -253,6 +272,19 @@ test "a hash row by hand: bigram to 4-gram over a two-layer toy table" {
     var dead: [2 * 3]i64 = undefined;
     h.hashes(&.{ 1, -1, 3 }, 2, 1, &dead);
     try std.testing.expectEqual(@as(i64, @mod(3 * 3 ^ 7 * 5, 11)), dead[0]);
+}
+
+test "MXFP4 rows decode: even columns in the low nibble, a scale per 32 values" {
+    var w: [32]u8 = @splat(0);
+    w[0] = 0xF2; // column 0: code 2 -> 1; column 1: code 0xF -> -6
+    w[16] = 0x07; // column 32: 6, under the second scale
+    const s = [_]u8{ 127, 126 }; // 1, 0.5
+    var out: [64]u16 = undefined;
+    decodeRow(&w, &s, &out);
+    try std.testing.expectEqual(bf16(1), out[0]);
+    try std.testing.expectEqual(bf16(-6), out[1]);
+    try std.testing.expectEqual(bf16(3), out[32]);
+    try std.testing.expectEqual(bf16(0), out[2]);
 }
 
 test "FP8 rows decode as the GPU does: exact values, power-of-two scales, bf16 rounding" {

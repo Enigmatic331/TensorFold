@@ -265,7 +265,9 @@ pub const HfText = struct {
         } else if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
-        const out = template.render(a, compiled, try toStd(a, messages), tools, .{ .object = context }, options.add_generation_prompt, &diag) catch |e| {
+        const msgs = try toStd(a, messages);
+        parseToolArguments(a, msgs);
+        const out = template.render(a, compiled, msgs, tools, .{ .object = context }, options.add_generation_prompt, &diag) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             problem.* = diag.msg;
             return error.Template;
@@ -312,4 +314,39 @@ pub fn toStd(a: Allocator, v: Value) Allocator.Error!std.json.Value {
             break :blk .{ .object = map };
         },
     };
+}
+
+/// Each assistant tool call's `arguments` given as a JSON string (the OpenAI wire form) parsed into its object, in
+/// place, as a model's own encoder does before rendering (DeepSeek-V4.1's encoding.py); a string that is not a JSON
+/// object stays a string. Templates then render the call's parameters, not one parameter holding the whole string.
+fn parseToolArguments(a: Allocator, messages: std.json.Value) void {
+    if (messages != .array) return;
+    for (messages.array.items) |*m| {
+        if (m.* != .object) continue;
+        const calls = m.object.getPtr("tool_calls") orelse continue;
+        if (calls.* != .array) continue;
+        for (calls.array.items) |*call| {
+            if (call.* != .object) continue;
+            const f = call.object.getPtr("function") orelse continue;
+            if (f.* != .object) continue;
+            const args = f.object.getPtr("arguments") orelse continue;
+            if (args.* != .string) continue;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, args.string, .{}) catch continue;
+            if (parsed == .object) args.* = parsed;
+        }
+    }
+}
+
+test "tool call arguments sent as JSON strings render as objects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\[{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}},
+        \\  {"function": {"name": "g", "arguments": "not json"}}]}]
+    , .{});
+    parseToolArguments(a, v);
+    const calls = v.array.items[0].object.get("tool_calls").?.array.items;
+    try std.testing.expect(calls[0].object.get("function").?.object.get("arguments").? == .object);
+    try std.testing.expect(calls[1].object.get("function").?.object.get("arguments").? == .string);
 }

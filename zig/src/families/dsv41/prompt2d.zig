@@ -17,6 +17,7 @@ const Config = @import("config.zig").Config;
 const plan = @import("plan.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
+const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
 const ring2d = @import("ring2d.zig");
@@ -24,6 +25,7 @@ const rdma_mod = @import("rdma.zig");
 const round2d = @import("round2d.zig");
 const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
+const Ports = @import("link.zig").Ports;
 const Comm = @import("comm.zig").Comm;
 
 const nccl = cuda.nccl;
@@ -37,26 +39,66 @@ pub fn split(g: u32, world: u32) !plan.Split {
     };
 }
 
-/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, one follower at a time (each
-/// follower retries its connect while rank 0 gets to it), so two ranks link exactly as before (rank 1 on PORT).
-/// NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
+/// How long a follower retries its connect to rank 0: TF_DS_CONNECT_S seconds, 300 by default. Rank 0's ports listen
+/// from its start (Fan.listenAt, before its weights load), so this covers only rank 0's process starting late.
+pub fn connectSeconds() u32 {
+    const v = std.c.getenv("TF_DS_CONNECT_S") orelse return 300;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 300;
+}
+
+/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, all the followers' ports at
+/// once, and takes them in order (a follower that is ready early waits in its port's backlog), so two ranks link
+/// exactly as before (rank 1 on PORT). NCCL's unique id goes from rank 0 down every link. (The port's link to N
+/// followers replaces this.)
 pub const Fan = struct {
     links: [3]?Link = .{ null, null, null },
+    ports: ?Ports = null, // rank 0's, from listenAt until join has taken every follower
 
     pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
-        var f: Fan = .{};
+        return openAt(io, ip, null, port, rank, world);
+    }
+
+    /// open, rank 0 listening for follower g on `listen[g - 1]` when given (each follower's own link address of this
+    /// node: on a ring without a switch a follower reaches the head at the address of the cable it comes in on), else
+    /// on `ip` for all of them.
+    pub fn openAt(io: std.Io, ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+        var f = try listenAt(ip, listen, port, rank, world);
         errdefer f.close();
-        if (world > 4) return error.UnsupportedWorld;
-        if (world < 2) return f;
-        if (rank == 0) {
-            for (1..world) |g| f.links[g - 1] = try Link.listen(ip, port + @as(u16, @intCast(g - 1)));
-        } else {
-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
-        }
+        try f.join(io, ip, port, rank, world, connectSeconds());
         return f;
     }
 
+    /// openAt's first half: rank 0's ports for all its followers, listening from here on (Model.open calls it before
+    /// the weights load, so a follower that loads faster than rank 0 is not left retrying); nothing on a follower.
+    pub fn listenAt(ip: [4]u8, listen: ?[3][4]u8, port: u16, rank: u32, world: u32) !Fan {
+        if (world > 4) return error.UnsupportedWorld;
+        var f: Fan = .{};
+        if (rank != 0 or world < 2) return f;
+        var ips: [3][4]u8 = undefined;
+        for (ips[0 .. world - 1], 0..) |*a, i| a.* = if (listen) |l| l[i] else ip;
+        f.ports = try Ports.open(ips[0 .. world - 1], port);
+        return f;
+    }
+
+    /// openAt's second half: rank 0 takes its followers in order; a follower connects to its port on rank 0, retrying
+    /// for `seconds` while rank 0 starts.
+    pub fn join(f: *Fan, io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32, seconds: u32) !void {
+        if (world < 2) return;
+        if (rank == 0) {
+            for (1..world) |g| f.links[g - 1] = try f.ports.?.accept(g);
+            f.ports = null;
+            return;
+        }
+        const at = port + @as(u16, @intCast(rank - 1));
+        f.links[0] = Link.connect(io, ip, at, seconds) catch |err| {
+            if (err == error.ConnectFailed) std.log.err("rank {d}: rank 0 did not answer at {d}.{d}.{d}.{d}:{d} in {d} s (TF_DS_CONNECT_S)", .{ rank, ip[0], ip[1], ip[2], ip[3], at, seconds });
+            return err;
+        };
+    }
+
     pub fn close(f: *Fan) void {
+        if (f.ports) |*p| p.close();
+        f.ports = null;
         for (&f.links) |*l| {
             if (l.*) |*x| x.close();
             l.* = null;
@@ -84,6 +126,46 @@ pub const Fan = struct {
         return .{ .lib = lib, .comm = c, .rank = rank, .world = world };
     }
 };
+
+/// TF_DS_2D_ORDER: the 2D node (role) each NCCL rank serves, "g0,g1,g2,g3" (rank 0 must serve node 0: it serves the
+/// API); unset, rank g serves node g. On four GB10s cabled as a ring 0-1-2-3-0 without a switch, "0,1,3,2" makes every
+/// node's row partner (g ^ 1) and column partner (g ^ 2) its cabled neighbours, and NCCL's ring all-gathers run over
+/// the cables in rank order.
+pub fn order() ![4]u32 {
+    const v = std.c.getenv("TF_DS_2D_ORDER") orelse return .{ 0, 1, 2, 3 };
+    return parseOrder(std.mem.span(v));
+}
+
+pub fn parseOrder(text: []const u8) ![4]u32 {
+    var out: [4]u32 = undefined;
+    var seen: [4]bool = @splat(false);
+    var it = std.mem.splitScalar(u8, text, ',');
+    for (&out) |*o| {
+        const x = std.mem.trim(u8, it.next() orelse return error.BadOrder, " ");
+        o.* = std.fmt.parseInt(u32, x, 10) catch return error.BadOrder;
+        if (o.* > 3 or seen[o.*]) return error.BadOrder;
+        seen[o.*] = true;
+    }
+    if (it.next() != null or out[0] != 0) return error.BadOrder;
+    return out;
+}
+
+/// The NCCL rank of each node g under `ord` (the inverse permutation).
+pub fn ncclOf(ord: [4]u32) [4]u32 {
+    var inv: [4]u32 = undefined;
+    for (ord, 0..) |g, i| inv[g] = @intCast(i);
+    return inv;
+}
+
+test "TF_DS_2D_ORDER: a ring's order and its inverse" {
+    const o = try parseOrder("0,1,3,2");
+    try std.testing.expectEqual([4]u32{ 0, 1, 3, 2 }, o);
+    try std.testing.expectEqual([4]u32{ 0, 1, 3, 2 }, ncclOf(o));
+    try std.testing.expectEqual([4]u32{ 0, 2, 3, 1 }, ncclOf(try parseOrder("0,3,1,2")));
+    try std.testing.expectError(error.BadOrder, parseOrder("1,0,2,3"));
+    try std.testing.expectError(error.BadOrder, parseOrder("0,1,1,2"));
+    try std.testing.expectError(error.BadOrder, parseOrder("0,1,2"));
+}
 
 fn len(r: ?[2]usize) usize {
     const x = r orelse return 0;
@@ -116,6 +198,21 @@ pub const Two = struct {
     rest_dec: ?exl3_experts2d.RestScratch = null,
     rest_chunk: ?exl3_experts2d.RestScratch = null,
     peer: u64 = 0,
+    // the NCCL rank of each 2D node g (TF_DS_2D_ORDER, model.zig): the all-gathers' slots and the partners' ranks. The
+    // identity on a switch; on a ring of four cabled in NCCL rank order, roles 0, 1, 3, 2 around it put every row and
+    // column partner on a cable of its own
+    nccl: [4]u32 = .{ 0, 1, 2, 3 },
+    // TF_DS_PAIR_SUM=1, agreed by every rank at startup (agreePairSum): a prompt chunk's gathers as pair sums
+    pair_sum: bool = false,
+    // WP4 (docs/prefill-plan.md): quarter-HC, agreed at startup (agreeQuarterHc) like pair_sum.
+    qhc: bool = false,
+    // WP5 (docs/prefill-plan.md, owner-row transport): agreed at startup (agreeOwnerGather), needs qhc and equal
+    // pair widths. Shrinks pairSum's column exchange to each rank's own owned quarter for a row-sharded layer's
+    // gather, instead of every row.
+    owner_gather: bool = false,
+    // WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup (agreeIdxShard), independent of qhc
+    // and owner_gather -- the indexer's own scoring kernels, not the HC-mix/gather path those two touch.
+    idx_shard: bool = false,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -125,6 +222,7 @@ pub const Two = struct {
         const x0 = s0.expertParts(c.*);
         const x1 = s1.expertParts(c.*);
         var t: Two = undefined;
+        t.pair_sum = false; // agreePairSum sets it on a model start; other callers keep the four-quarter gather
         t.r = s.rank;
         t.p = pp;
         t.heads = s.headSpan(c.*)[1];
@@ -158,12 +256,16 @@ pub const Two = struct {
         t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1] + t.ir) * 2);
         if (t.ir != 0) {
             if (t.gu[0] != t.gu[1]) return error.UnequalParityParts;
-            t.rest_dec = try restScratch(a, ex0, exl3_experts.exact_rows, slots, false);
-            t.rest_chunk = try restScratch(a, ex0, cap, slots, true);
+            // (Format.native computes the rest in the main launch: no rest scratch)
+            if (ex0.native == null) {
+                t.rest_dec = try restScratch(a, ex0, exl3_experts.exact_rows, slots, false);
+                t.rest_chunk = try restScratch(a, ex0, cap, slots, true);
+            }
             t.peer = try a.take(@max(cap, round_rows) * slots * (t.gu[t.p] + t.ir) * 2);
         }
         t.own = try a.take(round_rows * t.uw[pp] * 2);
         t.rings = null;
+        t.nccl = .{ 0, 1, 2, 3 };
         return t;
     }
 
@@ -197,7 +299,7 @@ pub const Two = struct {
             }
         }
         const g: u32 = @intCast(t.r + 2 * t.p);
-        try e.comm.exchange(mine, rows * width, t.peer, rows * width, .f16, g ^ 2, e.s);
+        try t.exchange(e, mine, rows * width, t.peer, rows * width, .f16, 2, t.nccl[g ^ 2]);
     }
 
     /// moe_2d's parity experts after the main gate / up and the rest's: the packs exchanged with the column partner,
@@ -210,6 +312,23 @@ pub const Two = struct {
         const part0 = if (t.p == 0) xd else t.peer;
         const part1 = if (t.p == 1) xd else t.peer;
         try e.ops.assembleRest(e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir);
+    }
+
+    /// `count` elements (`esize` bytes each) to NCCL rank `peer` and `rcount` from it: over the two-rank link to that ring
+    /// neighbour when the communicator has links (a ring without a switch: a send / recv on the world communicator may
+    /// take a port with no cable to the peer), as the link's all-gather (both parts at the larger count, through
+    /// `parts`, the partner's copied out); else NCCL send / recv.
+    pub fn exchange(t: *const Two, e: *const prompt.Engine, send: u64, count: usize, recv: u64, rcount: usize, dtype: cuda.nccl.DataType, esize: usize, peer: u32) !void {
+        const l = e.comm.linkTo(peer) orelse return e.comm.exchange(send, count, recv, rcount, dtype, peer, e.s);
+        const m = @max(count, rcount);
+        if (2 * m * esize > 4 * t.part_bytes or m * esize > t.part_bytes) return error.PartTooBig;
+        var src = send;
+        if (count < m) {
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(t.pad, send, count * esize, e.s.handle), "cuMemcpyDtoDAsync");
+            src = t.pad;
+        }
+        try e.comm.linkGather(l.comm, src, t.parts, m, dtype, e.s);
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(recv, t.parts + (1 - l.me) * m * esize, rcount * esize, e.s.handle), "cuMemcpyDtoDAsync");
     }
 
     /// Every node's part over NCCL into `parts` [4, n, wmax] (bytes), this node's `src` [n, w[p]] padded to wmax.
@@ -243,19 +362,262 @@ pub const Two = struct {
         for (0..4) |g| {
             const rr = g % 2;
             const pg = g / 2;
-            try e.ops.copyRows(e.s, t.parts + g * n * wmax * esize, wmax * esize, dst + rr * n * row + pg * w[0] * esize, row, w[pg] * esize, n);
+            try e.ops.copyRows(e.s, t.parts + t.nccl[g] * n * wmax * esize, wmax * esize, dst + rr * n * row + pg * w[0] * esize, row, w[pg] * esize, n);
         }
+    }
+
+    /// TF_DS_PAIR_SUM, resolved once for the whole world: every rank sends its setting, its node order (TF_DS_2D_ORDER,
+    /// as `nccl`), its gather widths (`ow`), whether both its partners (the TP2 partner, node ^ 1, and the other
+    /// pair's same TP2 rank, node ^ 2) are ring neighbours with a link, and whether its RDMA rings are enabled. Every
+    /// rank then checks every other rank's node order and widths against its own: a rank alone on a different
+    /// permutation (WP1 hardening; Codex's counterexample: three ranks on `0,1,3,2` and one on `0,2,3,1` would each
+    /// pass a same-setting-only check, since every chosen partner is still a ring neighbour on paper, yet the ranks
+    /// would address different partners under the same role numbers) now fails this exchange outright, with or
+    /// without TF_DS_PAIR_SUM: these hazards (`openLinks` and the RDMA rings also depend on each rank's own
+    /// environment) predate pair-sum and affect the plain four-quarter gather too. Ranks that disagree on the
+    /// *setting* still refuse to start, as before (a rank alone on the other path would leave the rest in collectives
+    /// it never joins); with the setting on everywhere, pair_sum engages only when every rank has both links, so all
+    /// ranks take the same path for every chunk. Before any prompt; the world all-gather is its barrier.
+    pub fn agreePairSum(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, rdma_on: bool) !void {
+        const want = if (std.c.getenv("TF_DS_PAIR_SUM")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const me: u32 = @intCast(t.r + 2 * t.p);
+        const links = comm.linkTo(t.nccl[me ^ 1]) != null and comm.linkTo(t.nccl[me ^ 2]) != null;
+        const w = comm.world;
+        const Cfg = extern struct { nccl: [4]u32, ow: [2]u32, flags: u32, pad: u32 = 0 };
+        const mine: Cfg = .{
+            .nccl = t.nccl,
+            .ow = .{ @intCast(t.ow[0]), @intCast(t.ow[1]) },
+            .flags = @as(u32, @intFromBool(want)) | (@as(u32, @intFromBool(links)) << 1) | (@as(u32, @intFromBool(rdma_on)) << 2),
+        };
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * @sizeOf(Cfg));
+        defer dev.free();
+        try dev.upload(0, std.mem.asBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + @sizeOf(Cfg), @sizeOf(Cfg) / 4, .u32, stream);
+        try stream.synchronize();
+        var all: [8]Cfg = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(@sizeOf(Cfg), std.mem.sliceAsBytes(all[0..w]));
+        var on: usize = 0;
+        var linked: usize = 0;
+        for (all[0..w], 0..) |x, i| {
+            if (!std.mem.eql(u32, &x.nccl, &mine.nccl)) {
+                std.log.err("TF_DS_PAIR_SUM: rank {d}'s node order {any} differs from this rank's {any} (TF_DS_2D_ORDER mismatch): refusing to start", .{ i, x.nccl, mine.nccl });
+                return error.TopologyMismatch;
+            }
+            if (x.ow[0] != mine.ow[0] or x.ow[1] != mine.ow[1]) {
+                std.log.err("TF_DS_PAIR_SUM: rank {d}'s gather widths {any} differ from this rank's {any}: refusing to start", .{ i, x.ow, mine.ow });
+                return error.TopologyMismatch;
+            }
+            on += x.flags & 1;
+            linked += (x.flags >> 1) & 1;
+        }
+        if (on != 0 and on != w) {
+            std.log.err("TF_DS_PAIR_SUM: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+            return error.PairSumMismatch;
+        }
+        t.pair_sum = on == w and linked == w;
+        if (on == w and !t.pair_sum) std.log.info("TF_DS_PAIR_SUM=1: {d} of {d} ranks have both partners as ring neighbours; every rank keeps the four-quarter gather", .{ linked, w });
+        if (t.pair_sum) std.log.info("TF_DS_PAIR_SUM=1: prompt gathers of 64+ rows as pair sums on all {d} ranks", .{w});
+    }
+
+    /// TF_DS_PAIR_SUM=1 (pair_sum, agreed at startup): a prompt chunk's quarters as the readers use them. Every
+    /// column's two TP2 partials are summed with NCCL over the link to this rank's TP2 partner (both ranks get the same
+    /// result), then the sums swapped with the other pair over that link; `dst` [2, n, w0 + w1] holds the sums in its
+    /// first plane and zeros in its second, and a reader adds G[0] + G[1]. Two link transfers of one part each instead
+    /// of the four-rank all-gather's three. Called only when pair_sum is set, so both links exist on every rank.
+    pub fn pairSum(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize) !void {
+        const me: u32 = @intCast(t.r + 2 * t.p);
+        const tp_link = e.comm.linkTo(t.nccl[me ^ 1]) orelse return error.PairSumNoLink;
+        const pair_link = e.comm.linkTo(t.nccl[me ^ 2]) orelse return error.PairSumNoLink;
+        const wmax = @max(w[0], w[1]);
+        if (n * wmax * 4 > t.part_bytes) return error.PartTooBig;
+        const mine = n * w[t.p];
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(t.pad, src, mine * 4, e.s.handle), "cuMemcpyDtoDAsync");
+        try e.comm.linkSum(tp_link.comm, t.pad, mine, e.s);
+        try e.comm.linkGather(pair_link.comm, t.pad, t.parts, n * wmax, .f32, e.s);
+        const row_bytes = (w[0] + w[1]) * 4;
+        for (0..2) |pg| {
+            const slot: usize = if (pg == t.p) pair_link.me else 1 - pair_link.me;
+            try e.ops.copyRows(e.s, t.parts + slot * n * wmax * 4, w[pg] * 4, dst + pg * w[0] * 4, row_bytes, w[pg] * 4, n);
+        }
+        // WP1 (Hector's reviewer, item 2): plane 1 is the identity element for the reader's add (dst[0] + dst[1]).
+        // Positive zero is the identity for every case except x = -0, where round-to-nearest gives x + (+0) = +0 but
+        // x + (-0) = x = -0: TF_DS_PAIR_SUM_NEGZERO=1 fills plane 1 with negative zero instead, so the add is the
+        // identity for every non-NaN x, signed zeros included (it does not address NaN or flush-to-zero; the
+        // tensor-level comparison, not this fill, is what decides exactness -- see WP1's exit gate).
+        if (std.c.getenv("TF_DS_PAIR_SUM_NEGZERO") != null)
+            try prompt.fill32(e, dst + n * row_bytes, 0x80000000, n * (w[0] + w[1]))
+        else
+            try prompt.fill(e, dst + n * row_bytes, 0, n * row_bytes);
+    }
+
+    /// WP5 (docs/prefill-plan.md, owner-row transport): pairSum, but the column link's exchange moves only the
+    /// `owned` rows this node actually keeps (a row-sharded quarter-HC layer reads nothing else -- qhcRepackG
+    /// copies exactly this same range back out of dst). linkSum (the TP partner's all-reduce) stays over every
+    /// row unchanged: every row's sum is needed by SOME rank's owned range, not just this node's own, and it is
+    /// already the cheaper of pairSum's two steps. `owned.start`/`owned.n` are qhcRange's own row range (q = cap
+    /// / world, uniform across ranks -- the NCCL rank IS the owner index), so the column partner's owned range is
+    /// computable here with no extra round trip: `peer_nccl * owned.n`.
+    ///
+    /// The exchange is NOT symmetric in content: this node sends its own pg's slice at the PARTNER's owned rows
+    /// (what the partner needs back, not what this node needs), and receives the partner's pg slice at THIS
+    /// node's owned rows, in the one ncclAllGather pairSum's own link already runs (same comm, same `t.parts`
+    /// scratch, never t.pad -- t.pad holds this node's own tp-summed data at every row and is read from, not
+    /// written to, by this step). This node's own pg at its own owned rows never needs the network at all: it is
+    /// already sitting in t.pad from linkSum, exactly where qhcRepackG's reasoning says a rank's own correctly-
+    /// computed rows need no collective to read back.
+    pub fn pairSumOwned(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, owned: prompt.QRows) !void {
+        const me: u32 = @intCast(t.r + 2 * t.p);
+        const tp_link = e.comm.linkTo(t.nccl[me ^ 1]) orelse return error.PairSumNoLink;
+        const peer_role: u32 = me ^ 2;
+        const pair_link = e.comm.linkTo(t.nccl[peer_role]) orelse return error.PairSumNoLink;
+        const wmax = @max(w[0], w[1]);
+        if (n * wmax * 4 > t.part_bytes or owned.n * wmax * 4 > t.part_bytes) return error.PartTooBig;
+        const mine = n * w[t.p];
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(t.pad, src, mine * 4, e.s.handle), "cuMemcpyDtoDAsync");
+        try e.comm.linkSum(tp_link.comm, t.pad, mine, e.s);
+        const peer_nccl = t.nccl[peer_role];
+        const peer_start = peer_nccl * owned.n;
+        try e.comm.linkGather(pair_link.comm, t.pad + peer_start * w[t.p] * 4, t.parts, owned.n * wmax, .f32, e.s);
+        const row_bytes = (w[0] + w[1]) * 4;
+        try e.ops.copyRows(e.s, t.pad + owned.start * w[t.p] * 4, w[t.p] * 4, dst + owned.start * row_bytes + t.p * w[0] * 4, row_bytes, w[t.p] * 4, owned.n);
+        const op = 1 - t.p;
+        const slot: usize = 1 - pair_link.me;
+        try e.ops.copyRows(e.s, t.parts + slot * owned.n * wmax * 4, w[op] * 4, dst + owned.start * row_bytes + op * w[0] * 4, row_bytes, w[op] * 4, owned.n);
+        if (std.c.getenv("TF_DS_PAIR_SUM_NEGZERO") != null)
+            try prompt.fill32(e, dst + n * row_bytes + owned.start * row_bytes, 0x80000000, owned.n * (w[0] + w[1]))
+        else
+            try prompt.fill(e, dst + n * row_bytes + owned.start * row_bytes, 0, owned.n * row_bytes);
+    }
+
+    /// TF_DS_QUARTER_HC, resolved once for the whole world (WP4, docs/prefill-plan.md): every rank sends its setting;
+    /// any disagreement refuses to start (the same reasoning as agreePairSum's setting check -- a rank alone on the
+    /// unsharded path would leave the rest in a world-4 all-gather it never joins). No link-adjacency check is
+    /// needed here, unlike agreePairSum: quarter-HC's new gathers are plain world-4 all-gathers over the base
+    /// communicator (every rank always has that), not point-to-point two-rank links.
+    pub fn agreeQuarterHc(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream, d2: usize, cap: usize) !void {
+        const want = if (std.c.getenv("TF_DS_QUARTER_HC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const w = comm.world;
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+        defer dev.free();
+        const mine: u32 = @intFromBool(want);
+        try dev.upload(0, std.mem.asBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
+        try stream.synchronize();
+        var all: [8]u32 = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+        var on: usize = 0;
+        for (all[0..w]) |x| on += x;
+        if (on != 0 and on != w) {
+            std.log.err("TF_DS_QUARTER_HC: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+            return error.QuarterHcMismatch;
+        }
+        t.qhc = on == w;
+        if (t.qhc) std.log.info("TF_DS_QUARTER_HC=1: row-sharded hc-mix (encoder-half full chunks) on all {d} ranks", .{w});
+        if (t.qhc) {
+            // WP1's own precedent (initLinks' link warm-up; patch 0010's "an all-reduce is its own first collective,
+            // distinct from the all-gather above" fix): NCCL connects a communicator's channels at a given
+            // message size/protocol on first use, not just at communicator creation -- the tiny config exchange
+            // just above does not warm the much larger per-layer x-gather this flag adds. Warm one real-sized
+            // world-4 all-gather here (q * D bf16 elements, q = cap / world: exactly qhcGatherRows' own shape),
+            // so the first row-sharded chunk's gather does not pay that connection cost live.
+            if (w != 0 and cap % w == 0) {
+                const q = cap / w;
+                var wsend = try cuda.DeviceBuffer.alloc(d, q * d2 * 2);
+                defer wsend.free();
+                var wrecv = try cuda.DeviceBuffer.alloc(d, w * q * d2 * 2);
+                defer wrecv.free();
+                try comm.allGather(wsend.ptr, wrecv.ptr, q * d2, .bf16, stream);
+                try stream.synchronize();
+            }
+        }
+    }
+
+    /// WP5 (docs/prefill-plan.md, owner-row transport): agreed at startup like pair_sum and qhc. Needs qhc (no
+    /// row-sharded layer reads the saving otherwise) and equal pair widths (pairSumOwned reads t.pad as a tight
+    /// w[t.p]-wide buffer at a row offset, pairSum's own layout, which only lines up with wmax when the two
+    /// pairs' widths are equal -- refuse here rather than read misaligned bytes live, the exact class of mistake
+    /// WP4's own buffer-stride bugs were).
+    pub fn agreeOwnerGather(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
+        const want = if (std.c.getenv("TF_DS_OWNER_GATHER")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const w = comm.world;
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+        defer dev.free();
+        const mine: u32 = @intFromBool(want);
+        try dev.upload(0, std.mem.asBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
+        try stream.synchronize();
+        var all: [8]u32 = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+        var on: usize = 0;
+        for (all[0..w]) |x| on += x;
+        if (on != 0 and on != w) {
+            std.log.err("TF_DS_OWNER_GATHER: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+            return error.OwnerGatherMismatch;
+        }
+        t.owner_gather = on == w and t.qhc and t.ow[0] == t.ow[1];
+        if (on == w and !t.owner_gather) std.log.info("TF_DS_OWNER_GATHER=1: needs TF_DS_QUARTER_HC=1 and equal pair widths (this run: qhc={}, ow={any}); keeping pairSum's full-row gather", .{ t.qhc, t.ow });
+        if (t.owner_gather) std.log.info("TF_DS_OWNER_GATHER=1: a row-sharded layer's gather moves only each rank's owned quarter over the column link, not every row", .{});
+    }
+
+    /// WP6(b) (docs/prefill-plan.md, indexer row-sharding): agreed at startup like pair_sum, qhc and
+    /// owner_gather, but independent of them -- it only needs a 2D engine with every rank's cap evenly
+    /// divisible into 16-row-aligned quarters (idxShardRange's own check; refused per-rank there, not here, so
+    /// a mismatch across ranks still shows as every rank agreeing on the flag but only some actually sharding).
+    pub fn agreeIdxShard(t: *Two, d: *const cuda.Driver, comm: *const Comm, stream: cuda.Stream) !void {
+        const want = if (std.c.getenv("TF_DS_IDX_SHARD")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        const w = comm.world;
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + w) * 4);
+        defer dev.free();
+        const mine: u32 = @intFromBool(want);
+        try dev.upload(0, std.mem.asBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + 4, 1, .u32, stream);
+        try stream.synchronize();
+        var all: [8]u32 = undefined;
+        if (w > all.len) return error.WorldTooLarge;
+        try dev.download(4, std.mem.sliceAsBytes(all[0..w]));
+        var on: usize = 0;
+        for (all[0..w]) |x| on += x;
+        if (on != 0 and on != w) {
+            std.log.err("TF_DS_IDX_SHARD: set on {d} of {d} ranks (this one: {s}); start every rank with the same value", .{ on, w, if (want) "1" else "unset" });
+            return error.IdxShardMismatch;
+        }
+        t.idx_shard = on == w;
+        if (t.idx_shard) std.log.info("TF_DS_IDX_SHARD=1: the indexer's scoring and top-k, for layers before the candidate source on a full chunk, run only each rank's owned quarter, all-gathering the picks", .{});
     }
 
     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
     /// part then pair 1's (from its column partner, the same rank of the other pair).
     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
         if (t.rings) |rs| if (try ringed(rs.catRank(e.s, src, dst, n, w, esize))) return;
+        // a prompt chunk's (64 rows or more; decode windows as before): the column partner's part alone, over the
+        // two-rank link to it when the communicator has one (a quarter of the four-rank all-gather's bytes; the same
+        // bytes land in dst)
+        const partner = if (n >= 64) e.comm.linkTo(t.nccl[@as(u32, @intCast(t.r + 2 * t.p)) ^ 2]) else null;
+        if (partner) |l| {
+            const wm = @max(w[0], w[1]);
+            const bytes = n * wm * esize;
+            if (2 * bytes > 4 * t.part_bytes or bytes > t.part_bytes) return error.PartTooBig;
+            var send = src;
+            if (w[t.p] != wm) {
+                try e.ops.copyRows(e.s, src, w[t.p] * esize, t.pad, wm * esize, w[t.p] * esize, n);
+                send = t.pad;
+            }
+            try e.comm.linkGather(l.comm, send, t.parts, bytes, .u8, e.s);
+            const row = (w[0] + w[1]) * esize;
+            for (0..2) |pg| {
+                const slot: usize = if (pg == t.p) l.me else 1 - l.me;
+                try e.ops.copyRows(e.s, t.parts + slot * bytes, wm * esize, dst + pg * w[0] * esize, row, w[pg] * esize, n);
+            }
+            return;
+        }
         const wmax = try t.allParts(e, src, n, w, esize);
         const row = (w[0] + w[1]) * esize;
         for (0..2) |pg| {
             const g = t.r + 2 * pg;
-            try e.ops.copyRows(e.s, t.parts + g * n * wmax * esize, wmax * esize, dst + pg * w[0] * esize, row, w[pg] * esize, n);
+            try e.ops.copyRows(e.s, t.parts + t.nccl[g] * n * wmax * esize, wmax * esize, dst + pg * w[0] * esize, row, w[pg] * esize, n);
         }
     }
 
@@ -265,7 +627,8 @@ pub const Two = struct {
     pub fn pairGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, width: usize, esize: usize) !void {
         if (t.rings) |rs| if (try ringed(rs.pairGather(e.s, src, dst, n, width, esize))) return;
         const wmax = try t.allParts(e, src, n, .{ width, width }, esize);
-        try e.ops.copyRows(e.s, t.parts + 2 * t.p * n * wmax * esize, wmax * esize, dst, width * esize, width * esize, 2 * n);
+        // the pair's two nodes in TP2 rank order (their slots need not be adjacent under TF_DS_2D_ORDER)
+        for (0..2) |rr| try e.ops.copyRows(e.s, t.parts + t.nccl[2 * t.p + rr] * n * wmax * esize, wmax * esize, dst + rr * n * width * esize, width * esize, width * esize, n);
     }
 
     /// wo_2d after wo_a: the rank's four groups (this node's two in ch.u [n, uw[p]], the partner's two), then wo_b
@@ -281,6 +644,7 @@ pub const Two = struct {
     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
         const c = e.c;
         const n = ch.n;
+        if (e.mx != null) return t.expertsNative(e, ch, lay.experts, ch.x, c.hidden, ch.pick, ch.wts, ch.xs.xd, ch.pm, n, false);
         if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
         if (t.ir != 0) {
@@ -291,6 +655,19 @@ pub const Two = struct {
         }
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+    }
+
+    /// Format.native's experts on a 2D node, chunk or round alike: this node's pack of every expert's gate / up (its main
+    /// blocks, its rest block for the experts whose rest is this pair's) into xd [rows * slots, pack] bf16, the rank's
+    /// whole intermediate assembled from the two pairs' packs (the same bytes moved as the EXL3 path's fp16 rows), down
+    /// for this node's output columns: out [rows, dw[p]] fp32. split_k: a decode round's (mx.gateUp).
+    pub fn expertsNative(t: *const Two, e: *const prompt.Engine, ch: *const prompt.Chunk, ex: weights.Experts, x: u64, ldx: usize, pick: u64, wts: u64, xd: u64, out: u64, rows: usize, split_k: bool) !void {
+        const k = e.mx.?;
+        try mx.gateUp(k, e.s, e.d, ex, ch.mxe, x, ldx, pick, wts, rows, e.c.swiglu_limit, xd, ex.width, split_k);
+        if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_gu) catch {};
+        if (t.ir != 0) try t.assembleParity(e, ex, xd, pick, rows * ch.mxe.slots) else try t.catRank(e, xd, t.xd_full, rows * ch.mxe.slots, t.gu, 2);
+        if (!split_k) if (prompt.ptimer) |pt| pt.mark(e.s, .m_x) catch {};
+        try mx.down(k, e.s, ex, ch.mxe, t.xd_full, ex.down_k, pick, rows, out, t.dw[t.p], false, split_k);
     }
 
     /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum
@@ -304,9 +681,9 @@ pub const Two = struct {
         const half = tmp + mine * 4;
         const their = half + mine * 2;
         const g: u32 = @intCast(t.r + 2 * t.p);
-        try e.comm.exchange(src, mine, other, mine, .f32, g ^ 1, e.s);
+        try t.exchange(e, src, mine, other, mine, .f32, 4, t.nccl[g ^ 1]);
         try e.ops.add2Bf16(e.s, src, other, half, mine);
-        try e.comm.exchange(half, mine, their, n * w[1 - t.p], .bf16, g ^ 2, e.s);
+        try t.exchange(e, half, mine, their, n * w[1 - t.p], .bf16, 2, t.nccl[g ^ 2]);
         const row = (w[0] + w[1]) * 2;
         for (0..2) |pg| {
             const from = if (pg == t.p) half else their;

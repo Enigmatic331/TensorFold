@@ -34,6 +34,8 @@ pub const Out = struct {
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+        /// Bytes that keep a silent stream alive (an SSE comment, or the API's ping); null: none.
+        keepalive: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     };
 };
 
@@ -54,7 +56,7 @@ const ClientOut = struct {
     a: Allocator,
 
     fn out(c: *ClientOut) Out {
-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
+        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
     }
 
     fn open(ctx: *anyopaque) error{Closed}!void {
@@ -71,15 +73,15 @@ const ClientOut = struct {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         routes.sendValue(c.conn, c.a, status, payload);
     }
+
+    fn keepalive(ctx: *anyopaque) error{Closed}!void {
+        const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        return sse.comment(c.conn);
+    }
 };
 
 /// Whether the client has gone, read between rounds (Python's socket_cancellation).
-pub const Gone = struct {
-    conn: *Conn,
-    pub fn check(g: Gone) bool {
-        return g.conn.peerGone();
-    }
-};
+pub const Gone = @import("stream_live.zig").Gone;
 
 /// ``error_body``: OpenAI's error object, with param and code where clients key on them.
 pub fn errorBody(a: Allocator, cx: *const Cx, param: ?[]const u8) Allocator.Error!Value {
@@ -122,7 +124,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
-    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "", .io = srv.io };
     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
     if (is_chat) {
         input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
@@ -148,6 +150,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+    if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
@@ -299,6 +302,7 @@ const Run = struct {
 
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+        if (reply.response_channel == .structured_json) return null;
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
@@ -435,28 +439,32 @@ const Run = struct {
 
     fn stream(r: *Run, gone: Gone, field: []const u8) void {
         const a = r.a;
-        const tools = r.plan.input.tools.len > 0;
+        const has_tools = r.plan.input.tools.len > 0;
         var cx: Cx = .{ .a = a };
         // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, has_tools, field);
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
             break :blk ready.prepared;
         };
+        const tools = has_tools and prepared.response_channel != .structured_json;
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) chat.release(r.srv, prepared.preparing);
         r.out.vt.open(r.out.ctx) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, gone) catch |e| {
+        var live = gone;
+        live.out = r.out; // open completed above; preflight refusals never enter the generation loop
+        live.every_ns = @intFromFloat(r.srv.config.sse_keepalive_s * std.time.ns_per_s);
+        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, live) catch |e| {
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {

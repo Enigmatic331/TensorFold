@@ -18,6 +18,14 @@ const known_diffs = [_]Known{
     .{ .group = "keys", .name = "metrics-counted" },
 };
 
+/// Drain the child server's logs so a full stdout pipe cannot block its request threads.
+fn drainStdout(io: Io, out: Io.File) void {
+    defer out.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = out.reader(io, &buf);
+    while ((reader.interface.discardShort(buf.len) catch return) == buf.len) {}
+}
+
 fn isKnown(group: []const u8, name: []const u8) bool {
     for (known_diffs) |k| {
         if (std.mem.eql(u8, k.group, group) and std.mem.eql(u8, k.name, name)) return true;
@@ -383,6 +391,9 @@ fn spawnServer(a: std.mem.Allocator, io: Io, binary: []const u8, fixtures: []con
         const line = reader.interface.takeDelimiterExclusive('\n') catch return error.NoPortLine;
         if (std.mem.startsWith(u8, line, "PORT ")) {
             const port = try std.fmt.parseInt(u16, std.mem.trim(u8, line[5..], " \r"), 10);
+            const drain = try std.Thread.spawn(.{}, drainStdout, .{ io, child.stdout.? });
+            child.stdout = null; // the drain owns and closes the pipe
+            drain.detach();
             return .{ .child = child, .port = port, .log_path = log_path, .key_path = key_path };
         }
     }

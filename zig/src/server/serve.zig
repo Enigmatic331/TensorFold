@@ -65,6 +65,8 @@ pub const Setup = struct {
     engine: api.Engine,
     text: model_text.Text,
     served: []const u8,
+    /// The checkpoint's folder (structured output reads its tokenizer.json and config.json).
+    model_dir: []const u8 = "",
     /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
     sampling: ?json.Value = null,
     environ: ?*const std.process.Environ.Map = null,
@@ -101,10 +103,16 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
+    const keepalive_s = keepaliveSeconds(env(s, "TF_SSE_KEEPALIVE_S")) orelse {
+        std.debug.print("tensorfold: TF_SSE_KEEPALIVE_S: seconds, a number >= 0\n", .{});
+        return 1;
+    };
     const config: server_mod.Config = .{
         .served_name = s.served,
+        .model_dir = s.model_dir,
         .model_ids = ids.items,
         .default_max_tokens = args.max_tokens,
+        .sse_keepalive_s = keepalive_s,
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
@@ -163,6 +171,24 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     while (srv.open_connections.load(.acquire) > 0 and waited < 40) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
     if (srv.open_connections.load(.acquire) > 0) std.process.exit(0); // replies still open: end without freeing what they read
     return 0;
+}
+
+/// TF_SSE_KEEPALIVE_S: unset or blank keeps 15 seconds; zero disables stream heartbeats.
+fn keepaliveSeconds(raw: ?[]const u8) ?f64 {
+    const t = std.mem.trim(u8, raw orelse "", " \t");
+    if (t.len == 0) return 15;
+    const x = std.fmt.parseFloat(f64, t) catch return null;
+    const limit = @as(f64, @floatFromInt(std.math.maxInt(i64))) / std.time.ns_per_s;
+    return if (std.math.isFinite(x) and x >= 0 and x < limit) x else null;
+}
+
+test "stream keepalive interval accepts zero and rejects non-finite or overflowing durations" {
+    const t = std.testing;
+    try t.expectEqual(@as(?f64, 15), keepaliveSeconds(null));
+    try t.expectEqual(@as(?f64, 15), keepaliveSeconds(" "));
+    try t.expectEqual(@as(?f64, 0), keepaliveSeconds("0"));
+    try t.expectEqual(@as(?f64, 0.1), keepaliveSeconds("0.1"));
+    for ([_][]const u8{ "-1", "nan", "inf", "1e40", "no" }) |bad| try t.expectEqual(null, keepaliveSeconds(bad));
 }
 
 /// ``--host`` as an address: an IP literal, else a name the resolver knows (localhost first).

@@ -39,12 +39,19 @@ pub const CallGate = struct {
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
 pub const Structure = struct {
-    kind: enum { json, json_schema, regex, choice, grammar },
-    /// The schema (JSON text), regex, choices (a JSON array) or EBNF; empty for any JSON object.
+    kind: enum { json, json_schema, regex, choice, grammar, structural_tag },
+    /// The schema (JSON text), regex, choices (a JSON array), EBNF or structural tag; empty for any JSON object.
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
+    /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
+    compiler: ?*grammar.Compiler = null,
+    /// Tokens the reply never draws while the grammar holds it, unless a row allows nothing else (a forced DSML call:
+    /// the marker spelled in plain characters, so that every marker is its own token).
+    ban: []const u32 = &.{},
 };
+
+pub const grammar = lanes.grammar;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -129,6 +136,8 @@ pub const Info = struct {
     structures: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
+    prompt_cache: bool = false,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
     /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears
@@ -271,6 +280,7 @@ pub const keepalive = @import("keepalive.zig");
 
 test {
     _ = @import("lane_host.zig");
+    _ = @import("lane_host_fill_test.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");

@@ -10,13 +10,18 @@ const Request = api.Request;
 const Reason = api.Reason;
 
 test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
+    try resumed(false);
+    try resumed(true);
+}
+
+fn resumed(partial: bool) !void {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
     var target: lanes.fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, (if (partial) target.chunkedBackend() else target.backend()), clock.clock());
     defer core.deinit();
     const Snaps = struct {
         fn bytes(_: *anyopaque, at: u32) u64 {
@@ -97,13 +102,18 @@ test "a lane host resumes a conversation from its kept prompt state and reports 
 }
 
 test "a turn's mark evicting the state it resumed from: the hit is reported first and the entry freed once" {
+    try evicted(false);
+    try evicted(true);
+}
+
+fn evicted(partial: bool) !void {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
     var target: lanes.fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, (if (partial) target.chunkedBackend() else target.backend()), clock.clock());
     defer core.deinit();
     const Snaps = struct { // a budget of one state: each keep records the hits the store had counted by then
         f: *lanes.fake.Fake,

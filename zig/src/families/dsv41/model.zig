@@ -13,14 +13,17 @@ const weights = @import("weights.zig");
 const prompt = @import("prompt.zig");
 const prompt2d = @import("prompt2d.zig");
 const round = @import("round.zig");
+const sampling = @import("sampling.zig");
 const draft = @import("draft.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_rows = @import("engram_rows.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const mx = @import("mx.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
@@ -28,9 +31,17 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
+const tri_index = @import("tri_index.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
+
+/// TF_DS_ENGRAM_WORKER=0: a fill's Engram rows read by a thread a chunk (the chunk before's end to this one's first
+/// Engram layer) instead of the fill's worker.
+var wk_on: bool = true;
+pub fn readWorkerEnv() void {
+    if (std.c.getenv("TF_DS_ENGRAM_WORKER")) |v| wk_on = !std.mem.eql(u8, std.mem.span(v), "0");
+}
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -46,6 +57,7 @@ pub const Options = struct {
     rank: u32,
     world: u32,
     master: [4]u8,
+    listen: ?[3][4]u8 = null, // rank 0 at world 4: the address to listen on for each follower (TF_TP_LISTEN), else master
     port: u16,
     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
@@ -108,6 +120,7 @@ pub const Model = struct {
     ops: ops_mod.Ops,
     ex: exact.Exact,
     par: ?exl3_experts2d.ParKernels, // the parity split's one-launch gate / up (parOne)
+    mxk: ?mx.Kernels = null, // Format.native: DeepSeek's own FP8 / MXFP4 checkpoint's kernels (mx.zig)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
     eng: prompt.Engine,
@@ -126,12 +139,19 @@ pub const Model = struct {
     aio: ?*engram_aio.Aio = null,
     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
     eh: ?prompt.EngramHost = null,
+    erows: ?*engram_rows.Rows = null, // TF_DS_ENGRAM_PACKED: Engram's rows from packed shards (engram_rows.zig)
     host_pos: []i64,
     ids64: []i64,
     vocab: usize,
     logits: []f32, // round.max_rows rows of logits on the host
     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
     amax_host: [round.max_rows]u32 = undefined,
+    // Track B (TF_DS_SAMPLE_CAND=1): a round's candidates on the device (vals f32, ids i64, flags i32; max_rows rows of
+    // sampling.max_candidates) and on the host
+    cand: u64 = 0,
+    cand_vals: [round.max_rows * sampling.max_candidates]f32 = undefined,
+    cand_ids: [round.max_rows * sampling.max_candidates]i64 = undefined,
+    cand_flags: [round.max_rows]i32 = undefined,
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
@@ -161,6 +181,7 @@ pub const Model = struct {
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
+        readWorkerEnv();
         if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
@@ -177,10 +198,16 @@ pub const Model = struct {
         m.world = o.world;
         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
         m.streams = o.streams;
+        // WP6 (docs/prefill-plan.md): TF_DS_IDX_RB=2 batches the indexer's prompt-chunk scoring kernel to the
+        // kit's own captured RB=2 variant (dequantizing a 64-key tile once for 2 rows instead of 1); the kit
+        // never captured RB above 2. Off (RB=1, today's behavior) unless set; validate on your own ring first.
+        if (std.c.getenv("TF_DS_IDX_RB")) |v| tri_index.idx_rb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tri_index.idx_rb;
         if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
         for ([_][:0]const u8{ "TF_DS_L2_ATTN_MB", "TF_DS_L2_MOE_MB", "TF_DS_L2_NEXT_MB", "TF_DS_L2_STRETCH_END_MB" }, 0..) |name, i| {
             if (std.c.getenv(name)) |v| round.l2_mb[i] = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_mb[i];
         }
+        if (std.c.getenv("TF_DS_L2_DN_MB")) |v| round.l2_dn_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dn_mb;
+        if (std.c.getenv("TF_DS_L2_DEC_MB")) |v| round.l2_dec_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_dec_mb;
         if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
         if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
         m.round_ms = o.round_ms orelse &draft.round_ms;
@@ -201,6 +228,7 @@ pub const Model = struct {
         m.aio = null;
         m.paio = null;
         m.eh = null;
+        m.erows = null;
         m.rdma_mod = null;
         m.ring = null;
         m.graphs = null;
@@ -212,26 +240,67 @@ pub const Model = struct {
         const c = &m.cfg;
         m.stream = try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
+        // rank 0's ports for its followers listen before its weights load: a follower that loads first connects and
+        // waits in its port's backlog instead of retrying until rank 0 and the followers before it are in
+        m.fan = try prompt2d.Fan.listenAt(o.master, o.listen, o.port, o.rank, o.world);
+        errdefer m.fan.close();
 
         // the weights (and the DSpark blocks) from the lane's rank cache
         m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
         errdefer m.cache_dir.close(io);
-        const cache_name = try rank_cache.find(a, io, m.cache_dir, o.rank, o.world);
+        // world 4: the 2D node this NCCL rank serves (TF_DS_2D_ORDER; its weight file is that node's)
+        const ord = if (o.world == 4) try prompt2d.order() else [4]u32{ 0, 1, 2, 3 };
+        const role: u32 = if (o.world == 4) ord[o.rank] else o.rank;
+        const cache_name = try rank_cache.find(a, io, m.cache_dir, role, o.world);
         m.ix = try rank_cache.open(gpa, io, m.cache_dir, cache_name);
         errdefer m.ix.deinit();
         m.cache_file = try m.cache_dir.openFile(io, cache_name, .{});
         errdefer m.cache_file.close(io);
-        var sp = try prompt2d.split(o.rank, o.world);
+        var sp = try prompt2d.split(role, o.world);
+        if (std.c.getenv("TF_DS_DUMP")) |dd| {
+            prompt.dump_dir = std.mem.span(dd);
+            prompt.dump_node = role;
+            // WP1's exit gate wants several layers' tensors in one dump (x, pa, pm, h at layers 0, 8, 19): accept a
+            // comma list, not just one layer, so one instrumented restart covers all of them.
+            if (std.c.getenv("TF_DS_DUMP_LAYER")) |dl| {
+                var it = std.mem.splitScalar(u8, std.mem.span(dl), ',');
+                var i: usize = 0;
+                while (it.next()) |tok| : (i += 1) {
+                    if (i >= prompt.dump_layers.len) break;
+                    prompt.dump_layers[i] = std.fmt.parseInt(i64, tok, 10) catch -1;
+                }
+            }
+        }
+        if (std.c.getenv("TF_DS_DRAFT_PROF")) |v| draft.dprof = v[0] == '1';
+        if (std.c.getenv("TF_DS_DRAFT_LINK")) |v| draft.pair_link = v[0] != '0';
+        if (std.c.getenv("TF_DS_CONF_CAL")) |v| {
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+            draft.conf_cal[0] = std.fmt.parseFloat(f64, it.next() orelse "1") catch return error.BadConfCal;
+            draft.conf_cal[1] = std.fmt.parseFloat(f64, it.next() orelse "0") catch return error.BadConfCal;
+        }
+        if (std.c.getenv("TF_DS_DRAFT_MS")) |v| draft.cost_ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadDraftMs;
+        if (std.c.getenv("TF_DS_DRAFT_LOG")) |v| {
+            draft.dlog = std.mem.span(v);
+            draft.ddump_node = role;
+        }
+        if (std.c.getenv("TF_DS_DRAFT_DUMP")) |dd| {
+            draft.ddump = std.mem.span(dd);
+            draft.ddump_node = role;
+            if (std.c.getenv("TF_DS_DRAFT_DUMP_PASS")) |dp| draft.ddump_pass = std.fmt.parseInt(usize, std.mem.span(dp), 10) catch 2;
+        }
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
 
-        // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
-        m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
-        errdefer m.fan.close();
+        // the ranks' links (rank 0 takes its followers in order; a follower retries its connect for TF_DS_CONNECT_S)
+        // and NCCL
+        try m.fan.join(io, o.master, o.port, o.rank, o.world, prompt2d.connectSeconds());
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
+        // world 4 on a ring without a switch (TF_DS_LINK_GRAPHS: this node's NCCL graph files of its links to the previous
+        // and the next rank): the partners' exchanges over two-rank links, each pinned to its cable
+        if (o.world == 4) if (std.c.getenv("TF_DS_LINK_GRAPHS")) |lg| try openLinks(gpa, d, &m.comm, m.stream, std.mem.span(lg));
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
         if (sp.pair == null and o.rdma_devices != null) {
             const list = o.rdma_devices.?;
@@ -259,8 +328,10 @@ pub const Model = struct {
         errdefer m.ops.unload();
         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
         errdefer m.ex.unload();
-        m.par = if (sp.parity and parOne()) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
+        m.par = if (sp.parity and parOne() and c.format == .exl3) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
+        m.mxk = if (c.format == .native) try mx.Kernels.load(d, cuda.kernels.dsv41_native) else null;
+        errdefer if (m.mxk) |*x| x.unload();
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
@@ -288,6 +359,11 @@ pub const Model = struct {
         errdefer if (m.rdma_rings) |*x| x.close(gpa);
         if (sp.pair != null) {
             m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+            m.two.?.nccl = prompt2d.ncclOf(ord);
+            try m.two.?.agreePairSum(d, &m.comm, m.stream, o.rdma_devices != null);
+            try m.two.?.agreeQuarterHc(d, &m.comm, m.stream, c.hidden, chunk_rows);
+            try m.two.?.agreeOwnerGather(d, &m.comm, m.stream);
+            try m.two.?.agreeIdxShard(d, &m.comm, m.stream);
             if (o.rdma_devices) |devs| {
                 const image: []const u8 = if (o.rdma_kernels) |path|
                     try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
@@ -296,13 +372,15 @@ pub const Model = struct {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, role, ord, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid(), .pdl = rdmaPdl() }, &m.comm, m.stream);
                 m.two.?.rings = &m.rdma_rings.?;
             }
         }
+        logPdlControls(m.comm.rank);
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
+        if (m.mxk) |*x| m.eng.mx = x;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.ctx_cap); // a stream's keys at most
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
@@ -316,6 +394,8 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
         m.amax = try m.arena.take(round.max_rows * 4);
+        m.cand = try m.arena.take(round.max_rows * (sampling.max_candidates * 12 + 4));
+        m.eng.agree_flag = try m.arena.take(64); // G0.3: the graph captures' agreement byte
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
@@ -353,10 +433,44 @@ pub const Model = struct {
                 m.paio = try engram_aio.Aio.init(gpa, io, 4096);
                 m.eh.?.paio = m.paio;
             }
+            // TF_DS_ENGRAM_PACKED (a folder of tf-dsv41-engram-pack's shards): a row is one read, kept in a row cache
+            // (TF_DS_ENGRAM_CACHE_MIB, default 2048, 0 none) and decoded on the GPU; TF_DS_ENGRAM_OWNED=1: each node
+            // reads only its range of the rows and a byte max over the nodes fills the rest; TF_DS_ENGRAM_INSTREAM=1:
+            // a round's landing as a host step on the stream (with TF_DS_ENGRAM_AIO)
+            if (std.c.getenv("TF_DS_ENGRAM_PACKED")) |pd| {
+                // packed shards hold FP8 rows and decode them on the GPU; NVIDIA's MXFP4 tables are read as stored
+                var eit = m.tables.?.layers.valueIterator();
+                while (eit.next()) |t| if (t.dim() != t.row_w) return error.PackedEngramIsFp8;
+                const owned = engram_rows.envOn("TF_DS_ENGRAM_OWNED");
+                const eh = &m.eh.?;
+                const cols = eh.hasher.cols();
+                const k = eh.hi - eh.lo;
+                const sl = if (owned) cols else k;
+                const rec = c.engram_head_dim + c.engram_head_dim / 32;
+                const mib: usize = if (std.c.getenv("TF_DS_ENGRAM_CACHE_MIB")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+                m.erows = try engram_rows.Rows.open(gpa, d, &m.tables.?, m.epool.?, m.aio, m.paio, .{
+                    .dir = std.mem.span(pd),
+                    .owned = owned,
+                    .node = role,
+                    .nodes = o.world,
+                    .lo = eh.lo,
+                    .k = k,
+                    .cols = cols,
+                    .dim = c.engram_head_dim,
+                    .layer_ids = c.engram_layers.slice(),
+                    .round_rows = round.max_rows,
+                    .chunk_rows = chunk_rows,
+                    .cache_bytes = mib << 20,
+                    .instream = engram_rows.envOn("TF_DS_ENGRAM_INSTREAM"),
+                    .round_dev = try m.arena.take(round.max_rows * sl * rec),
+                    .chunk_dev = try m.arena.take(chunk_rows * sl * rec),
+                });
+                eh.pk = m.erows;
+            }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
-        if (c.vision) {
+        if (c.vision and c.format == .exl3) { // (Format.native: the checkpoint's own gate.bias_vl, loaded with the weights)
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
         }
@@ -375,6 +489,7 @@ pub const Model = struct {
         m.spans.deinit(m.gpa);
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
+        if (m.dr) |*dr| dr.deinit();
         if (m.timer) |t| {
             t.deinit();
             m.gpa.destroy(t);
@@ -386,6 +501,7 @@ pub const Model = struct {
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
         m.rd.dropPar();
+        if (m.erows) |r| r.close();
         if (m.aio) |x| x.deinit();
         if (m.paio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
@@ -395,6 +511,7 @@ pub const Model = struct {
         m.arena.deinit();
         m.rope_buf.free();
         if (m.par) |*x| x.unload();
+        if (m.mxk) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();
@@ -417,11 +534,83 @@ pub const Model = struct {
         m.gpa.destroy(m);
     }
 
+    /// The two-rank ring links (Comm.initLinks): every rank's id for its next link gathered over the world communicator,
+    /// then both links made with their graph files ("prev,next", from TF_DS_LINK_GRAPHS).
+    fn openLinks(gpa: std.mem.Allocator, d: *const cuda.Driver, comm: *comm_mod.Comm, stream: cuda.Stream, spec: []const u8) !void {
+        var it = std.mem.splitScalar(u8, spec, ',');
+        const prev = it.next() orelse return error.BadLinkGraphs;
+        const next = it.next() orelse return error.BadLinkGraphs;
+        if (it.next() != null) return error.BadLinkGraphs;
+        const pz = try gpa.dupeSentinel(u8, prev, 0);
+        defer gpa.free(pz);
+        const nz = try gpa.dupeSentinel(u8, next, 0);
+        defer gpa.free(nz);
+        const nccl = cuda.nccl;
+        const per = @sizeOf(nccl.UniqueId);
+        var mine: nccl.UniqueId = undefined;
+        try comm.lib.check(comm.lib.api.ncclGetUniqueId(&mine), "ncclGetUniqueId");
+        var dev = try cuda.DeviceBuffer.alloc(d, (1 + comm.world) * per);
+        defer dev.free();
+        try dev.upload(0, std.mem.asBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + per, per, .u8, stream);
+        try stream.synchronize();
+        const ids = try gpa.alloc(nccl.UniqueId, comm.world);
+        defer gpa.free(ids);
+        try dev.download(per, std.mem.sliceAsBytes(ids));
+        try comm.initLinks(ids, .{ pz, nz });
+        // NCCL connects a communicator at its first collective (~0.1 s on the ring's links): warm both links here, in
+        // initLinks' order (each link's two ranks reach it together), so no prompt's first exchange over a link (the
+        // first Engram layer's row-partner sum) pays it. WP1 hardening (Codex's open item 4): an all-reduce is its own
+        // first collective on a link (distinct from the all-gather above), so TF_DS_PAIR_SUM's first pairSum call
+        // would otherwise pay that connection cost on the live prompt; warm one fp32 all-reduce here too.
+        const order: [2]usize = if (comm.rank % 2 == 0) .{ 1, 0 } else .{ 0, 1 };
+        for (order) |which| if (comm.links[which]) |l| {
+            try comm.linkGather(l, dev.ptr, dev.ptr + per, per, .u8, stream);
+            try stream.synchronize();
+            try comm.linkSum(l, dev.ptr, 1, stream);
+            try stream.synchronize();
+        };
+    }
+
+    /// The decode plan's G0.2 controls (TF_DS_DEC_PDL, TF_DS_RDMA_PDL, TF_DS_TRITON_PDL_ATTR, TF_DS_PDL), one line on each
+    /// rank when any is off, so a run can show that every rank has the same ones.
+    fn logPdlControls(rank: usize) void {
+        const off = struct {
+            fn f(name: [*:0]const u8) bool {
+                return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            }
+        }.f;
+        const native = off("TF_DS_DEC_PDL");
+        const ring = !rdmaPdl();
+        const tri_attr = off("TF_DS_TRITON_PDL_ATTR");
+        const all = off("TF_DS_PDL");
+        if (!(native or ring or tri_attr or all)) return;
+        const w = struct {
+            fn f(o: bool) []const u8 {
+                return if (o) "off" else "on";
+            }
+        }.f;
+        std.log.info("decode PDL controls on rank {d}: native decode kernels {s}, RDMA kernels {s}, Triton consumer launch attribute {s}, every launch attribute {s}", .{ rank, w(native or all), w(ring or all), w(tri_attr or all), w(all) });
+    }
+
+    /// TF_DS_RDMA_PDL=0 (or the Python build's TF_RDMA_PDL=0): the RDMA rings' kernels as ordinary launches with their
+    /// pdl argument 0 (no griddepcontrol in them): the decode plan's G0.2 control (b). Unset or any other value: as served.
+    pub fn rdmaPdl() bool {
+        for ([_][*:0]const u8{ "TF_DS_RDMA_PDL", "TF_RDMA_PDL" }) |name| if (std.c.getenv(name)) |v| return !std.mem.eql(u8, std.mem.span(v), "0");
+        return true;
+    }
+
+    /// TF_DS_RDMA_GID: the RDMA rings' GID index on every device; unset, each device's first RoCE v2 IPv4 GID.
+    pub fn rdmaGid() ?u8 {
+        const v = std.c.getenv("TF_DS_RDMA_GID") orelse return null;
+        return std.fmt.parseInt(u8, std.mem.span(v), 10) catch null;
+    }
+
     /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
     /// connected, and started once both are (an all-gather as the barrier).
     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
         if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = rdmaGid() });
         errdefer r.destroy(gpa);
         const per = @sizeOf(rdma.Info);
         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
@@ -465,6 +654,7 @@ pub const Model = struct {
     pub fn joinAhead(m: *Model) void {
         if (m.ahead) |th| th.join();
         m.ahead = null;
+        if (m.eh) |*eh| prompt.engramWorkerStop(eh);
     }
 
     /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
@@ -590,6 +780,8 @@ pub const Model = struct {
         for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
+        prompt.ptimer = pt;
+        defer prompt.ptimer = null;
         if (pt) |t| try t.mark(m.stream, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
@@ -597,27 +789,40 @@ pub const Model = struct {
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
-        // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
-        // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
-        // chunk's start and the next's once the first is applied
+        // Engram rows read ahead while the GPU runs the layers before them. A fill of the prompt (seq a prefix of
+        // fill_seq): the fill's worker thread (prompt.engramWorker), up to a chunk ahead of the layers, so a chunk's
+        // table reads overlap the chunk before it. Else (a chunk alone): a thread from the chunk's start, the first
+        // layer's rows then the next's once the first is applied.
+        const use_wk = m.eh != null and wk_on and m.fill_seq.len >= start + n and m.fill_seq.ptr == seq.ptr;
         var ahead: ?std.Thread = m.ahead;
         m.ahead = null;
         defer if (ahead) |th| th.join();
         if (m.eh) |*eh| {
-            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
-                ahead.?.join();
+            if (use_wk) {
+                if (ahead) |th| th.join();
                 ahead = null;
-            }
-            if (ahead == null) {
-                eh.ahead_start = start;
-                eh.ahead_n = n;
-                eh.ahead_ready = .{ false, false };
-                eh.ahead_err = null;
-                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                const same = eh.wk_thread != null and eh.wk_seq.ptr == m.fill_seq.ptr and eh.wk_seq.len == m.fill_seq.len and
+                    start >= eh.wk_start and (start - eh.wk_start) % chunk_rows == 0 and
+                    (start - eh.wk_start) / chunk_rows <= eh.wk_used[0].load(.acquire);
+                if (!same) try prompt.engramWorkerStart(eh, c, m.fill_seq, start, chunk_rows);
+            } else {
+                prompt.engramWorkerStop(eh);
+                if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
+                    ahead.?.join();
+                    ahead = null;
+                }
+                if (ahead == null) {
+                    eh.ahead_start = start;
+                    eh.ahead_n = n;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                }
             }
         }
         for (0..c.layers) |li| {
             if (li == c.layers / 2) {
+                try prompt.qhcResyncBoundary(e, ch, li);
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
                     // run while this one's last layers do; the profile alone waits
@@ -632,45 +837,61 @@ pub const Model = struct {
             }
             if (e.w.layers[li].engram_wkv != null) {
                 const eh = if (m.eh) |*x| x else return error.NoEngramTables;
-                if (ahead) |th| {
-                    th.join();
-                    ahead = null;
-                }
-                if (eh.ahead_err) |err| return err;
-                try prompt.engramApply(e, ch, eh, li, seq);
                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
-                const ne = @min(2, c.engram_layers.slice().len);
-                if (j + 1 < ne) {
-                    if (!eh.ahead_ready[j + 1])
-                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
-                } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
-                    // the next chunk's rows while this one's layers run
-                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
-                    eh.ahead_start = start + n;
-                    eh.ahead_n = nn;
-                    eh.ahead_ready = .{ false, false };
-                    eh.ahead_err = null;
-                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                if (use_wk and j < 2) {
+                    // the worker's rows, or its records with packed shards (engram_rows.zig)
+                    if (eh.pk != null) {
+                        eh.use_stage = try prompt.engramWorkerStage(eh, j, start, chunk_rows);
+                    } else eh.use_rows = try prompt.engramWorkerRows(eh, j, start, chunk_rows);
+                    defer {
+                        eh.use_rows = null;
+                        eh.use_stage = null;
+                    }
+                    try prompt.engramApply(e, ch, eh, li, seq);
+                    // the rows are uploaded (a pageable copy is staged before it returns): the slot is the worker's
+                    eh.wk_used[j].store((start - eh.wk_start) / chunk_rows + 1, .release);
+                } else {
+                    if (ahead) |th| {
+                        th.join();
+                        ahead = null;
+                    }
+                    if (eh.ahead_err) |err| return err;
+                    try prompt.engramApply(e, ch, eh, li, seq);
+                    const ne = @min(2, c.engram_layers.slice().len);
+                    if (j + 1 < ne) {
+                        if (!eh.ahead_ready[j + 1])
+                            ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+                    }
                 }
                 if (pt) |t| try t.mark(m.stream, .engram);
             }
             // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
-            if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
+            if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j, li);
             try prompt.attnMixes(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(m.stream, .attn);
-            try prompt.gather(e, ch, ch.pa, ch.ga);
+            try prompt.gather(e, ch, ch.pa, ch.ga, li);
             if (pt) |t| try t.mark(m.stream, .gather_a);
             try prompt.ffnMixes(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .mix_ffn);
             try prompt.moe(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .moe);
-            try prompt.gather(e, ch, ch.pm, ch.gm);
+            try prompt.gather(e, ch, ch.pm, ch.gm, li + 1);
             if (pt) |t| try t.mark(m.stream, .gather_m);
+            // WP1's exit gate: the gathers' own output (what TF_DS_PAIR_SUM changes), both sublayers, at every
+            // requested layer of the first chunk of at least 64 rows (prompt.dump_layers; dump_done stops it after
+            // that chunk, below). The >= 64 guard matters: TF_DS_PAIR_SUM only engages at 64+ rows (prompt.gather),
+            // so a smoke test or validate.py's short prompts would otherwise spend the one-shot dump on a chunk
+            // where pair-sum never ran at all, comparing the untouched quarters path with itself.
+            if (prompt.dump_dir != null and !prompt.dump_done and ch.n >= 64) {
+                prompt.dump(e, li, "ga", ch.ga, 2 * ch.n * c.hidden * 4);
+                prompt.dump(e, li, "gm", ch.gm, 2 * ch.n * c.hidden * 4);
+            }
             prompt.endLayer(ch);
         }
         try prompt.head(e, ch);
+        if (ch.n >= 64) prompt.dump_done = prompt.dump_dir != null;
         if (pt) |t| try t.mark(m.stream, .head);
         if (m.dr) |*dr| {
             // its taps (the tap layers side by side) into the slot's drafter rings
@@ -733,6 +954,7 @@ pub const Model = struct {
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
         try m.stream.synchronize();
+        if (m.erows) |r| try r.roundCheck(); // a stream host step's failed read fails the round
         if (m.prof) m.t_absorb = m.now() - t1;
     }
 
@@ -773,6 +995,22 @@ pub const Model = struct {
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
         return m.amax_host[0..R];
+    }
+
+    /// Track B: the round's first `count` candidates a row (sampling.topCandidates' set and order) on the host, from the
+    /// device's logits: vals and ids [R, count], flags [R] (non-zero: that row must be read whole, roundLogits).
+    pub fn roundCandidates(m: *Model, R: usize, count: usize) !struct { vals: []const f32, ids: []const i64, flags: []const i32 } {
+        const d = m.ctx.d;
+        const mc = sampling.max_candidates;
+        const vals = m.cand;
+        const ids = m.cand + round.max_rows * mc * 4;
+        const flags = ids + round.max_rows * mc * 8;
+        try m.ops.topCandRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, vals, ids, flags);
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_vals, vals, R * count * 4), "cuMemcpyDtoH");
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_ids, ids, R * count * 8), "cuMemcpyDtoH");
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.cand_flags, flags, R * 4), "cuMemcpyDtoH");
+        return .{ .vals = m.cand_vals[0 .. R * count], .ids = m.cand_ids[0 .. R * count], .flags = m.cand_flags[0..R] };
     }
 
     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {

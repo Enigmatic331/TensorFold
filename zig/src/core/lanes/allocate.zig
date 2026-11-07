@@ -7,6 +7,14 @@ pub const Cost = struct { width: u32, ms: f64 };
 
 /// Draft prefixes per stream with the most expected tokens a ms; fixed rows always run. Caller frees.
 pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64) ![]u32 {
+    return allocateRows(gpa, fixed, probs, costs, overhead_ms, max_rows, 0.0, 0);
+}
+
+/// allocate with draft rows priced apart (the decode plan's A3, draft_row_ms > 0): a round's forward as `costs` at its
+/// `streams` (their pending rows: rows of different streams) plus draft_row_ms for every other row it runs (drafts,
+/// forced rows: one stream's further rows share its experts and cost less), the same split Rule.observeOverhead
+/// subtracts; 0: `costs` at the round's total rows, as before.
+pub fn allocateRows(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, draft_row_ms: f64, streams: u64) ![]u32 {
     const counts = try gpa.alloc(u32, probs.len);
     defer gpa.free(counts);
     const best_counts = try gpa.alloc(u32, probs.len);
@@ -16,7 +24,8 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, 
     for (fixed) |f| rows += f;
     var expected: f64 = @floatFromInt(rows);
     const timed = !costs.empty();
-    var best = rate(costs, timed, rows, expected, overhead_ms);
+    const base = if (streams > 0) @min(streams, rows) else rows;
+    var best = rateRows(costs, timed, base, rows, expected, overhead_ms, draft_row_ms);
     while (rows < max_rows) {
         // the likeliest next node, ties to the lowest stream (Python's heapq of (-p, stream))
         var pick: ?usize = null;
@@ -33,13 +42,20 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, 
         counts[s] += 1;
         rows += 1;
         expected += pick_p;
-        const now = rate(costs, timed, rows, expected, overhead_ms);
+        const now = rateRows(costs, timed, base, rows, expected, overhead_ms, draft_row_ms);
         if (now > best) {
             best = now;
             @memcpy(best_counts, counts);
         }
     }
     return best_counts;
+}
+
+fn rateRows(costs: *const Table, timed: bool, base: u64, total: u64, expected: f64, overhead_ms: f64, draft_row_ms: f64) f64 {
+    if (draft_row_ms <= 0.0) return rate(costs, timed, total, expected, overhead_ms);
+    var cost: f64 = 1.0;
+    if (timed) cost = (costs.get(@intCast(base)) orelse return -1.0) + draft_row_ms * @as(f64, @floatFromInt(total - base));
+    return expected / (cost + overhead_ms);
 }
 
 fn rate(costs: *const Table, timed: bool, total: u64, expected: f64, overhead_ms: f64) f64 {

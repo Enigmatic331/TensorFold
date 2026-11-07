@@ -77,7 +77,22 @@ pub const Config = struct {
 /// Kernel launches so far in this process (a profile's count by phase).
 pub var count: u64 = 0;
 
-pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
+/// TF_DS_PDL=0: every launch without the programmatic-dependent-launch attribute, whatever its caller asks (a fully
+/// serialized stream; the decode plan's G0.2 control (d), docs/UNIFIED-DECODE-IMPROVEMENTS.md). The kernels are the same:
+/// griddepcontrol.wait is a no-op for an ordinary launch. Read at the first launch; unset or any other value: as asked.
+pub fn pdlAllowed() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const v = if (std.c.getenv("TF_DS_PDL")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
+    S.v = v;
+    return v;
+}
+
+pub fn launch(f: Function, cfg_in: Config, stream: Stream, args: *Args) Error!void {
+    var cfg = cfg_in;
+    if (cfg.pdl and !pdlAllowed()) cfg.pdl = false;
     try cfg.validate();
     count += 1;
     const d = f.d;

@@ -18,17 +18,39 @@ pub const Rings = struct {
     col: *rdma.Ring,
     pair: *rdma.Ring,
 
-    /// The three rings of node `g` (of 4): created, their infos exchanged over `comm` (world 4), connected and
-    /// started on every node before any returns.
-    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, g: u32, s: rdma.Settings, comm: *const Comm, stream: cuda.Stream) !Rings {
-        if (g >= 4 or comm.world != 4) return error.NotFourNodes;
+    /// The three rings of node `g` (of 4): created, their infos exchanged over `comm` (world 4, NCCL rank i serving node
+    /// ord[i]: TF_DS_2D_ORDER), connected and started on every node before any returns. On a ring without a switch each
+    /// ring routes its peers over the devices on their cables, and the four nodes' ring relays a node's part to the node
+    /// across through the two between (rdma.zig).
+    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, g: u32, ord: [4]u32, s: rdma.Settings, comm: *const Comm, stream: cuda.Stream) !Rings {
+        if (g >= 4 or comm.world != 4 or comm.rank >= 4) return error.NotFourNodes;
+        var seen: [4]bool = @splat(false);
+        for (ord) |x| {
+            if (x >= 4 or seen[x]) return error.BadOrder;
+            seen[x] = true;
+        }
+        if (ord[comm.rank] != g) return error.NotFourNodes;
         const r = g % 2;
         const p = g / 2;
-        const all4 = try rdma.Ring.create(gpa, d, k, devices, g, 4, s);
+        var rank_of: [4]u32 = undefined; // node -> NCCL rank
+        for (ord, 0..) |x, i| rank_of[x] = @intCast(i);
+        // TF_DS_RDMA_CPUS=a,b,c: the three proxies' CPUs (the four nodes' ring's, the column pair's, the row pair's)
+        var cpus: [3]?u16 = .{ null, null, null };
+        if (std.c.getenv("TF_DS_RDMA_CPUS")) |v| {
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+            for (&cpus) |*c| c.* = if (it.next()) |t| std.fmt.parseInt(u16, std.mem.trim(u8, t, " "), 10) catch null else null;
+        }
+        var s4 = s;
+        s4.cpu = cpus[0];
+        var sc = s;
+        sc.cpu = cpus[1];
+        var sr = s;
+        sr.cpu = cpus[2];
+        const all4 = try rdma.Ring.create(gpa, d, k, devices, g, 4, s4);
         errdefer all4.destroy(gpa);
-        const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, s); // members (r, 0), (r, 1): ring rank = pair
+        const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, sc); // members (r, 0), (r, 1): ring rank = pair
         errdefer col.destroy(gpa);
-        const pair = try rdma.Ring.create(gpa, d, k, devices, r, 2, s); // members (0, p), (1, p): ring rank = TP2 rank
+        const pair = try rdma.Ring.create(gpa, d, k, devices, r, 2, sr); // members (0, p), (1, p): ring rank = TP2 rank
         errdefer pair.destroy(gpa);
         // this node's infos: the four-node ring's toward each node, the column pair's and the row pair's toward each member
         const per = @sizeOf(rdma.Info);
@@ -41,16 +63,16 @@ pub const Rings = struct {
         try dev.upload(0, std.mem.sliceAsBytes(&mine));
         try comm.allGather(dev.ptr, dev.ptr + 8 * per, 8 * per, .u8, stream);
         try stream.synchronize();
-        var all: [4][8]rdma.Info = undefined;
+        var all: [4][8]rdma.Info = undefined; // by NCCL rank
         try dev.download(8 * per, std.mem.sliceAsBytes(&all));
         var remote4: [4]rdma.Info = undefined;
-        for (0..4) |q| remote4[q] = all[q][g];
+        for (0..4) |q| remote4[q] = all[rank_of[q]][g];
         try all4.connect(&remote4);
         var remote_col: [2]rdma.Info = undefined;
-        for (0..2) |pp| remote_col[pp] = all[r + 2 * pp][4 + p];
+        for (0..2) |pp| remote_col[pp] = all[rank_of[r + 2 * pp]][4 + p];
         try col.connect(&remote_col);
         var remote_pair: [2]rdma.Info = undefined;
-        for (0..2) |rr| remote_pair[rr] = all[2 * p + rr][6 + r];
+        for (0..2) |rr| remote_pair[rr] = all[rank_of[2 * p + rr]][6 + r];
         try pair.connect(&remote_pair);
         // every queue pair ready on every node before any ring sends: one more all-gather as the barrier
         try comm.allGather(dev.ptr, dev.ptr + 8 * per, 1, .u8, stream);
@@ -58,6 +80,8 @@ pub const Rings = struct {
         try all4.start();
         try col.start();
         try pair.start();
+        const rt = all4.routes();
+        std.log.info("2D RDMA rings on node {d}: lanes to nodes 0-3 {d},{d},{d},{d} (0: relayed), {d} relay(s); column {d} lane(s), row {d}", .{ g, rt.lanes[0], rt.lanes[1], rt.lanes[2], rt.lanes[3], rt.relays, col.routes().lanes[1 - p], pair.routes().lanes[1 - r] });
         return .{ .g = g, .r = r, .p = p, .all4 = all4, .col = col, .pair = pair };
     }
 

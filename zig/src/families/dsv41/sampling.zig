@@ -106,6 +106,20 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     var values: [max_candidates]f32 = undefined;
     var ids: [max_candidates]i64 = undefined;
     const width = topCandidates(row, count, &values, &ids);
+    return sampleCandidates(values[0..width], ids[0..width], position, s);
+}
+
+/// The candidates a sampled row reads: min(row length, top_k + margin) (sampleRow's `count`).
+pub fn candidateCount(n: usize, s: Sampling) usize {
+    return @min(n, s.top_k + margin);
+}
+
+/// choose_rows on a row's first candidates in topCandidates' order (values, ids: its `width` = candidateCount of the
+/// row, or the row's length when shorter): sampleRow past its scan (Track B hands it the GPU's candidates).
+pub fn sampleCandidates(values: []const f32, ids: []const i64, position: u64, s: Sampling) !i64 {
+    if (s.top_k == 0) return error.NotPortedYet;
+    const width = values.len;
+    if (width == 0 or ids.len != width or width > max_candidates) return error.TooManyCandidates;
     // choose_rows on the candidates (already in lexsort's order)
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);

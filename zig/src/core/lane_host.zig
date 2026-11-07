@@ -51,6 +51,10 @@ pub const LaneHost = struct {
     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
+    // Track D: a round run between an admitting job's prompt chunks failed (its error): once the prompt's pass has
+    // unwound, every admitted job fails with it, as after any failed round
+    between_failed: ?[]const u8 = null,
+    fill_next: usize = 0, // next admitted prompt to advance by one chunk
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -74,13 +78,28 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        images: pc.Images = .none, // the images key of the prompt's prefixes (0 for a prompt without images)
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.request.images.len > 0) return; // a kept state is keyed by tokens: an image's are its placeholder's
-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
+            if (job.host.cache) |store| _ = store.keepKeyed(job.request.prompt, at, s, job.request.chunks, job.images);
+        }
+
+        /// The images key of the request's `[0, at)`: its pictures' spans and bytes, hashed. A kept state holds its
+        /// image spans' placeholders as tokens, so the key is what tells one picture from another (0: none).
+        fn imageKey(ctx: ?*const anyopaque, at: u32) u64 {
+            const r: *const Request = @ptrCast(@alignCast(ctx orelse return 0));
+            var h = std.hash.Wyhash.init(0x696d61676573); // "images"
+            var any = false;
+            for (r.images) |img| {
+                if (img.at >= at) continue; // the image starts past the kept prefix
+                any = true;
+                var fields = [3]u64{ img.at, img.tokens, std.hash.Wyhash.hash(0, img.bytes) };
+                h.update(std.mem.asBytes(&fields));
+            }
+            return if (any) h.final() | 1 else 0; // odd: never 0, which means no image in the prefix
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -197,6 +216,40 @@ pub const LaneHost = struct {
         job.sink.event(job.sink.ctx, job.id, &event);
     }
 
+    /// Track D: between this admitting job's prompt chunks, the other jobs' cancels taken (this one's stay queued for
+    /// its own pass to see), then a round of the streams already live and their new tokens delivered, as the host's loop
+    /// does after any round. A failed round ends this prompt's pass; admitOne then fails every admitted job.
+    fn between(ctx: *anyopaque) anyerror!void {
+        const job: *Job = @ptrCast(@alignCast(ctx));
+        const h = job.host;
+        h.takeCancelsExcept(job);
+        if (h.core.activeCount() == 0) return;
+        h.core.step() catch |e| {
+            h.between_failed = @errorName(e);
+            return e;
+        };
+        var i: usize = 0;
+        while (i < h.admitted.items.len) {
+            const other = h.admitted.items[i];
+            if (other == job or !other.started) {
+                i += 1;
+                continue;
+            }
+            if (h.deliver(other)) {
+                h.lock();
+                _ = h.admitted.orderedRemove(i);
+                h.unlock();
+            } else i += 1;
+        }
+    }
+
+    /// Whether a round between an admitting job's chunks would run (another stream is live): the backend asks first,
+    /// so a prompt alone keeps its read-ahead.
+    fn betweenReady(ctx: *anyopaque) bool {
+        const job: *Job = @ptrCast(@alignCast(ctx));
+        return job.host.core.activeCount() > 0;
+    }
+
     /// A job's cancel hook for its prompt pass: its id is in `cancels`, or the host is closing (read under the lock).
     fn cancelled(ctx: *anyopaque) bool {
         const job: *Job = @ptrCast(@alignCast(ctx));
@@ -217,6 +270,7 @@ pub const LaneHost = struct {
 
     /// Sends a stream's new tokens; true once it has finished (its job freed).
     fn deliver(h: *LaneHost, job: *Job) bool {
+        if (!job.started or job.prefilled == null) return false;
         h.send(job);
         if (!job.stream.finished) return false;
         const reason: Reason = switch (job.stream.reason) {
@@ -225,7 +279,7 @@ pub const LaneHost = struct {
             .@"error" => .failed,
             else => .stop,
         };
-        h.finish(job, reason, "");
+        h.finish(job, reason, job.stream.problem);
         return true;
     }
 
@@ -236,6 +290,7 @@ pub const LaneHost = struct {
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
+            if (s.grammar) |g| g.deinit(h.gpa);
             s.deinit(h.gpa);
             job.proposer.deinit();
         }
@@ -256,11 +311,43 @@ pub const LaneHost = struct {
         h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
     }
 
+    /// takeCancels for every job but `keep` (an admitting job in its prompt pass): under the one lock that takes the
+    /// other ids, `keep`'s stay named (for its pass's own check and the loop after it), so a cancel of it arriving
+    /// meanwhile can never free it here.
+    fn takeCancelsExcept(h: *LaneHost, keep: *Job) void {
+        h.mutex.lockUncancelable(h.io);
+        var ids: std.ArrayList(Id) = .empty;
+        var i: usize = 0;
+        while (i < h.cancels.items.len) {
+            const id = h.cancels.items[i];
+            if (id == keep.id) {
+                i += 1;
+                continue;
+            }
+            ids.append(h.gpa, id) catch {
+                i += 1;
+                continue;
+            };
+            _ = h.cancels.orderedRemove(i);
+        }
+        h.mutex.unlock(h.io);
+        h.cancelIds(ids.items);
+        ids.deinit(h.gpa);
+    }
+
     /// Cancels queued and admitted jobs named since the last round.
     fn takeCancels(h: *LaneHost) void {
         h.mutex.lockUncancelable(h.io);
         const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
         h.cancels.clearRetainingCapacity();
+        h.mutex.unlock(h.io);
+        h.cancelIds(ids);
+        h.gpa.free(ids);
+    }
+
+    /// The jobs these ids name, queued or admitted, cancelled (their ids already taken from `cancels`).
+    fn cancelIds(h: *LaneHost, ids: []const Id) void {
+        h.mutex.lockUncancelable(h.io);
         var dropped: std.ArrayList(*Job) = .empty;
         for (ids) |id| {
             for (h.queued.items, 0..) |job, i| if (job.id == id) {
@@ -273,7 +360,7 @@ pub const LaneHost = struct {
         dropped.deinit(h.gpa);
         for (ids) |id| {
             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
-                if (!job.stream.finished) h.core.discard(&job.stream);
+                if (job.started and !job.stream.finished) h.core.discard(&job.stream);
                 h.lock();
                 _ = h.admitted.orderedRemove(i);
                 h.unlock();
@@ -281,7 +368,6 @@ pub const LaneHost = struct {
                 break;
             };
         }
-        h.gpa.free(ids);
     }
 
     fn lock(h: *LaneHost) void {
@@ -300,7 +386,7 @@ pub const LaneHost = struct {
             return false;
         }
         if (h.full_wait) |n| {
-            const active = h.core.activeCount();
+            const active = if (h.core.fills()) h.admitted.items.len else h.core.activeCount();
             if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
                 h.unlock();
                 return false;
@@ -321,16 +407,56 @@ pub const LaneHost = struct {
             return true;
         };
         h.unlock();
+        if (h.core.fills()) return true;
+        if (!h.setup(job)) return true;
+        const began = job.began;
+        if (h.loneFits(job)) return h.runLone(job, began);
+        h.core.addStream(&job.stream) catch |e| {
+            if (h.between_failed) |msg| {
+                // a round between this prompt's chunks failed: this job and every admitted one end with its error
+                h.between_failed = null;
+                _ = h.drop(job, msg);
+                h.failAll(msg);
+                return true;
+            }
+            if (e == error.Cancelled) return h.cancel(job);
+            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            return h.drop(job, h.words(e));
+        };
+        h.prefilled(job, began);
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (now - began >= long_pass_ns) {
+            h.lock();
+            h.finish_until = now + finish_ns;
+            h.unlock();
+        }
+        if (h.deliver(job)) h.remove(job);
+        return true;
+    }
+
+    /// Look up and consume a kept state in the same engine turn: another prompt may evict it at its next mark.
+    fn setup(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
+        job.images = .{ .ctx = @ptrCast(r), .hash = Job.imageKey };
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (r.images.len == 0) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        if (h.cache) |store| if (store.lookupKeyed(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks, job.images)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
+            _ = h.drop(job, "the drafter could not start");
+            return false;
+        };
+        // Keep ownership here until Stream.init succeeds. A failed setup drops
+        // the job; drop's true means work was handled, not that setup succeeded.
+        const reply_grammar = if (r.structure) |st| h.constraint(st) catch |e| {
+            job.proposer.deinit();
+            _ = h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+            return false;
+        } else null;
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -348,34 +474,69 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
+            .grammar = reply_grammar,
         }) catch {
             job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            if (reply_grammar) |g| g.deinit(h.gpa);
+            _ = h.drop(job, "out of memory");
+            return false;
         };
+        job.stream.between = .{ .ptr = job, .run = between, .ready = betweenReady };
         job.started = true;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| {
-            if (e == error.Cancelled) return h.cancel(job);
-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
-            return h.drop(job, h.words(e));
-        };
-        h.prefilled(job, began);
-        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        if (now - began >= long_pass_ns) {
-            h.lock();
-            h.finish_until = now + finish_ns;
-            h.unlock();
-        }
-        if (h.deliver(job)) h.remove(job);
         return true;
+    }
+
+    /// One chunk per turn, rotating between admitted prompts so arrivals can run before a long prompt ends.
+    fn fillOne(h: *LaneHost) void {
+        if (!h.core.fills()) return;
+        const n = h.admitted.items.len;
+        for (0..n) |offset| {
+            const i = (h.fill_next + offset) % n;
+            const job = h.admitted.items[i];
+            if (job.prefilled != null) continue;
+            h.fill_next = i + 1;
+            const first = !job.started;
+            if (first and !h.setup(job)) return;
+            const done = h.core.fillStream(&job.stream, first) catch |e| {
+                if (e == error.Cancelled) {
+                    _ = h.cancel(job);
+                } else if (e == error.ContextFull and h.admitted.items.len > 1) {
+                    _ = h.requeue(job);
+                } else {
+                    _ = h.drop(job, h.words(e));
+                }
+                return;
+            };
+            job.reported(); // the first step restored it; no dangling cache entry across another prompt's keep
+            if (done) {
+                h.prefilled(job, job.began);
+                if (h.deliver(job)) h.remove(job);
+            }
+            return;
+        }
+    }
+
+    fn filling(h: *const LaneHost) bool {
+        if (!h.core.fills()) return false;
+        for (h.admitted.items) |job| if (job.prefilled == null) return true;
+        return false;
     }
 
     /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).
     fn nearEnd(h: *LaneHost) bool {
         for (h.admitted.items) |job| if (job.started and !job.stream.finished and job.stream.budgetLeft() <= finish_left) return true;
         return false;
+    }
+
+    /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
+    fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
+        const c = st.compiler orelse return error.NoGrammarCompiler;
+        const k = try c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
+        errdefer k.deinit(h.gpa);
+        if (st.ban.len > 0) k.ban = try h.gpa.dupe(u32, st.ban);
+        return k;
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
@@ -464,6 +625,7 @@ pub const LaneHost = struct {
         job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
         h.gpa.free(job.marks);
         job.marks = &.{};
+        if (job.stream.grammar) |g| g.deinit(h.gpa); // the next admission compiles its own
         job.stream.deinit(h.gpa);
         job.proposer.deinit();
         job.started = false;
@@ -477,7 +639,7 @@ pub const LaneHost = struct {
             h.finish(job, .failed, "out of memory");
             return true;
         };
-        h.full_wait = h.core.activeCount();
+        h.full_wait = if (h.core.fills()) h.admitted.items.len else h.core.activeCount();
         h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
         h.unlock();
         return false;
@@ -514,6 +676,7 @@ pub const LaneHost = struct {
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
+            h.fillOne();
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -524,7 +687,7 @@ pub const LaneHost = struct {
                 continue;
             }
             if (h.core.activeCount() == 0) {
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                if (!h.filling() and h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
@@ -553,7 +716,7 @@ pub const LaneHost = struct {
         h.admitted.clearRetainingCapacity();
         h.unlock();
         for (jobs) |job| {
-            if (!job.stream.finished) h.core.discard(&job.stream);
+            if (job.started and !job.stream.finished) h.core.discard(&job.stream);
             h.finish(job, .failed, message);
         }
         h.gpa.free(jobs);
@@ -672,4 +835,6 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
 
-test { _ = @import("lane_host_test.zig"); }
+test {
+    _ = @import("lane_host_test.zig");
+}

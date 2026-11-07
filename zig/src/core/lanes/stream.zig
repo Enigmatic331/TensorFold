@@ -1,5 +1,6 @@
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
+const grammar = @import("grammar.zig");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const Allocator = std.mem.Allocator;
@@ -88,6 +89,15 @@ pub const MarkHook = struct {
     at: *const fn (ptr: *anyopaque, s: *Stream, at: u32) void,
 };
 
+/// Called between prompt chunks after the chunk's mark hook, the GPU's queue holding the chunk (the decode plan's Track
+/// D, resumable prefill): the host's turn to run a round of the streams already decoding, so one prompt's pass stops
+/// nobody's decode for its whole length. An error ends this prompt's pass.
+pub const BetweenHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque) anyerror!void,
+    ready: *const fn (ptr: *anyopaque) bool, // whether `run` would run a round (another stream is live)
+};
+
 /// Drafts the backend holds for the stream's next round; a tree keeps its tokens and parents on the host.
 pub const Held = struct {
     count: u32,
@@ -136,6 +146,7 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
 };
 
 pub const Stream = struct {
@@ -155,8 +166,11 @@ pub const Stream = struct {
     loop_guard: bool,
     loop_period: ?u32 = null,
     chunks: []const u32,
+    grammar: ?*grammar.Constraint = null, // follows each committed token; its masks keep the draws inside it
+    problem: []const u8 = "", // why a stream finished with `error` (static text)
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    between: ?BetweenHook = null, // the host's round between this stream's prompt chunks (a backend may call it)
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
@@ -189,6 +203,8 @@ pub const Stream = struct {
     inflight: ?u64 = null,
     served: ?u64 = null,
     granted: ?u32 = null,
+    gain: ?f64 = null, // the expected landed drafts of its last grant (allocate; depth.Rule.prepassSelect)
+    gain_at: [9]f64 = @splat(0), // gain_at[j]: those of its first j granted drafts (j <= granted, 8 at most)
     copy_width: ?u32 = null,
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
@@ -210,6 +226,11 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .grammar = spec.grammar,
+        };
+        // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
+        if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
+            s.think_close = s.think_close[0 .. at + 1];
         };
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
@@ -230,6 +251,7 @@ pub const Stream = struct {
         s.inflight = null;
         s.served = null;
         s.granted = null;
+        s.gain = null;
         s.copy_width = null;
     }
 
@@ -308,6 +330,19 @@ pub const Stream = struct {
             try s.context.append(gpa, t);
             landed += 1;
             if (@as(i64, t) == s.think_end) s.think_open = false;
+            if (s.grammar) |g| {
+                if (!try g.follow(t)) {
+                    s.finished = true;
+                    s.reason = .@"error";
+                    s.problem = "the reply's grammar rejected a chosen token";
+                    break;
+                }
+                if (g.finished() and !s.isEos(t)) { // the grammar's stop token ends the reply (eos ignored or not)
+                    s.finished = true;
+                    s.reason = .stop;
+                    break;
+                }
+            }
             const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
             if (s.isEos(t) or s.stopped()) {
                 s.finished = true;

@@ -56,8 +56,9 @@ fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
-/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
-fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. A DSML block
+/// ends at its first closer, or with ``extend`` where ``reply_text.blockEnd`` ends it (past a closer inside a value).
+fn envelopes(a: Allocator, text: []const u8, extend: bool) Allocator.Error![]Envelope {
     var found: std.ArrayList(Envelope) = .empty;
     var pos: usize = 0;
     while (findCI(text, "<tool_call>", pos)) |s| {
@@ -86,13 +87,13 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
     }
     pos = 0;
     while (find(text, dsml_open, pos)) |s| {
-        const e = find(text, dsml_close, s + dsml_open.len) orelse break;
+        const e = (if (extend) reply_text.blockEnd(text, s + dsml_open.len, dsml_open, dsml_close, true) else find(text, dsml_close, s + dsml_open.len)) orelse break;
         try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
         pos = e + dsml_close.len;
     }
     pos = 0;
     while (find(text, dsml41_open, pos)) |s| {
-        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
+        const e = (if (extend) reply_text.blockEnd(text, s + dsml41_open.len, dsml41_open, dsml41_close, true) else find(text, dsml41_close, s + dsml41_open.len)) orelse break;
         try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
         pos = e + dsml41_close.len;
     }
@@ -117,9 +118,37 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
         try known.put(a, try std.ascii.allocLowerString(a, name), name);
     }
     const schemas = try tool_params.schemas(a, tools);
-    const envs = try envelopes(a, text);
+    // DSML values are not escaped, so a value can hold its block's closer: the blocks read past such closers are taken
+    // only when they give strictly more calls than the blocks cut at the first closer, so no reply loses a call
+    const first = try envelopes(a, text, false);
+    const cut = try parseEnvelopes(a, text, first, &known, &schemas, max_calls);
+    const longer = try envelopes(a, text, true);
+    if (sameEnvelopes(first, longer)) return cut;
+    const read = try parseEnvelopes(a, text, longer, &known, &schemas, max_calls);
+    const n_read = if (read.calls) |c| c.len else 0;
+    const n_cut = if (cut.calls) |c| c.len else 0;
+    return if (n_read > n_cut) read else cut;
+}
+
+/// The inside of ``body`` (an envelope's payload) when it opens with a DSML opener, read as it always was: the opener cut
+/// from its start and a closer's length from its end. The payload of a ``<tool_call>`` block (or another tool-call
+/// envelope) can open with a DSML opener and be too short to hold a closer as well; cutting both from it would slice past
+/// its own start, so it reads as no DSML block. Every payload long enough reads as before.
+fn dsmlBlock(body: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
+    if (body.len < open.len + close.len or !std.mem.startsWith(u8, body, open)) return null;
+    return body[open.len .. body.len - close.len];
+}
+
+fn sameEnvelopes(x: []const Envelope, y: []const Envelope) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (p.start != q.start or p.end != q.end) return false;
+    return true;
+}
+
+/// The content and calls of ``text`` split into ``envs``.
+fn parseEnvelopes(a: Allocator, text: []const u8, envs: []const Envelope, known: *const std.StringArrayHashMapUnmanaged([]const u8), schemas: *const tool_params.Schemas, max_calls: ?usize) Allocator.Error!Parsed {
     if (envs.len == 0) {
-        if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
+        if (try bareCalls(a, text, known, max_calls)) |calls| return .{ .content = "", .calls = calls };
         return .{ .content = text, .calls = null };
     }
     var calls: std.ArrayList(Value) = .empty;
@@ -128,20 +157,19 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
-        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+        if (dsmlBlock(env.payload, dsml41_open, dsml41_close)) |inner| {
+            try dsml41Calls(a, inner, known, max_calls, &calls, &residue);
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
+            if (dsmlBlock(env.payload, dsml_open, dsml_close)) |inner| {
                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => null,
                 };
             }
-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
+            const one = payload(a, env.payload, schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
             };
@@ -153,7 +181,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             break :blk null;
         };
         const good = if (parsed) |list| list.len > 0 and for (list) |c| {
-            if ((try callName(a, c, &known)) == null) break false;
+            if ((try callName(a, c, known)) == null) break false;
         } else true else false;
         if (!good) {
             // a malformed or unoffered call stays text when calls are unlimited, and drops out of a one-call reply
@@ -161,7 +189,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             continue;
         }
         for (parsed.?) |c| {
-            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
+            if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);

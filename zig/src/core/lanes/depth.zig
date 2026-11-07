@@ -10,6 +10,7 @@ pub const Constants = struct {
     cost_rate: f64 = 0.2, // weight of the newest round in a depth's measured time
     plain_margin: f64 = 1.05, // a drafted depth must beat plain rounds' tokens a ms by this much
     plain_wait_most: u64 = 128, // plain rounds between probes at most
+    prepass_probe: u64 = 8, // prepass: shared passes a stream sits out before it joins one again to remeasure its gain
     draft_slack: i64 = 2, // drafts a stream offers past what its last shared round granted it
 };
 
@@ -20,6 +21,7 @@ pub const State = struct {
     plain: ?u64 = null,
     wait: ?u64 = null,
     ms: ?Table = null, // plain_guard: the stream's own round times
+    skipped: u64 = 0, // prepass: shared passes sat out in a row
 
     pub fn deinit(st: *State, gpa: Allocator) void {
         gpa.free(st.p);
@@ -34,6 +36,8 @@ pub const Who = struct {
     finished: bool,
     forced: bool,
     granted: ?u32 = null,
+    gain: ?f64 = null,
+    gain_at: [9]f64 = @splat(0),
     stream: ?*anyopaque = null,
 };
 
@@ -54,6 +58,10 @@ pub const Rule = struct {
     shared_costs: *const Table,
     mtp_step_ms: f64,
     plain_guard: bool,
+    prepass: bool = false,
+    pass_ms: [2]f64 = .{ 0, 0 }, // prepass: a batched head pass's ms, a + b x streams (measured; TF_DS_PASS_MS)
+    round_streams: usize = 0, // prepass: the shared round's streams, drafting or not (roundStreams sets it)
+    draft_row_ms: f64 = 0.0, // A3 (TF_DS_DRAFT_ROW_MS): a draft row's ms apart from the streams' rows (0: the table alone)
     node_probabilities: bool,
     batch_rows: u32,
     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
@@ -165,6 +173,115 @@ pub const Rule = struct {
         return best;
     }
 
+    /// The decode plan's A2 (docs/UNIFIED-DECODE-IMPROVEMENTS.md), `prepass` on (TF_DS_PREPASS=1), shared rounds:
+    /// which streams join the next head pass, chosen before it. The pass costs its rows whether or not a draft is
+    /// verified after it, so the streams in it and their drafts are priced together: each stream's expected landed
+    /// drafts `gain` and rows `granted` from its last allocation, a round's ms as the shared table at the round's rows
+    /// plus the pass's measured `pass_ms[0] + pass_ms[1] x streams in it` (counted once). Streams join in order of gain
+    /// a row, the best prefix of that order by expected tokens a ms (each stream's pending row: one token, drafted or not).
+    /// Streams with no gain measured yet, and a stream that sat out `prepass_probe` passes in a row (its gain stale),
+    /// always join. Decided anew every round at the round's stream count. depths[i] = 0 for a stream that sits out:
+    /// its windows plain, its drafter history still absorbed by every verify. Replies are the same tokens either way
+    /// (drafts only decide how many rows a round verifies).
+    pub fn prepassSelect(r: *Rule, whos: []Who, depths: []i64) !void {
+        if (!r.prepass or whos.len == 0 or (r.pass_ms[0] == 0 and r.pass_ms[1] == 0)) return;
+        const n = whos.len;
+        const in = try r.gpa.alloc(bool, n);
+        defer r.gpa.free(in);
+        const order = try r.gpa.alloc(usize, n);
+        defer r.gpa.free(order);
+        var m: usize = 0; // candidates: drafting streams with a measured gain and not due to probe
+        var members: usize = 0;
+        // every stream of the round has its pending row and token, drafting or not
+        const all = @max(n, r.round_streams);
+        var rows: f64 = @floatFromInt(all);
+        var tokens: f64 = @floatFromInt(all);
+        for (whos, depths, in, 0..) |w, d, *x, i| {
+            x.* = false;
+            if (d == 0) continue;
+            const st = if (w.state.*) |*s| s else {
+                x.* = true;
+                members += 1;
+                continue;
+            };
+            if (w.gain == null or w.granted == null or st.skipped >= r.k.prepass_probe) {
+                x.* = true;
+                members += 1;
+                if (w.granted != null) {
+                    const c = cut(w, d);
+                    tokens += w.gain_at[c];
+                    rows += @floatFromInt(c);
+                }
+                continue;
+            }
+            order[m] = i;
+            m += 1;
+        }
+        // the candidates by gain a row (rows at least 1: a pass row's share), highest first, ties by stream order
+        const Ctx = struct {
+            w: []Who,
+            d: []i64,
+            fn density(c: @This(), i: usize) f64 {
+                const k = cut(c.w[i], c.d[i]);
+                return c.w[i].gain_at[k] / @as(f64, @floatFromInt(@max(k, 1)));
+            }
+            fn lt(c: @This(), a: usize, b: usize) bool {
+                const da = c.density(a);
+                const db = c.density(b);
+                return da > db or (da == db and a < b);
+            }
+        };
+        std.sort.insertion(usize, order[0..m], Ctx{ .w = whos, .d = depths }, Ctx.lt);
+        // every prefix of that order, the best kept (as allocate keeps its best prefix: the pass's fixed part can make
+        // one stream lose and several win)
+        var best = r.passRate(rows, tokens, members);
+        var take: usize = 0;
+        for (order[0..m], 1..) |i, j| {
+            const c = cut(whos[i], depths[i]);
+            rows += @floatFromInt(c);
+            tokens += whos[i].gain_at[c];
+            members += 1;
+            const now = r.passRate(rows, tokens, members);
+            if (now > best) {
+                best = now;
+                take = j;
+            }
+        }
+        for (order[0..take]) |i| in[i] = true;
+        for (whos, depths, in) |w, *d, x| {
+            if (d.* == 0) continue;
+            const st = if (w.state.*) |*s| s else continue;
+            if (x) {
+                st.skipped = 0;
+            } else {
+                st.skipped += 1;
+                d.* = 0;
+            }
+        }
+    }
+
+    /// The drafts a stream would verify next round as prepassSelect prices them: its last grant, but no more than the
+    /// depth asked of the pass now (room, a copy ahead) nor than gain_at holds.
+    fn cut(w: Who, d: i64) usize {
+        const g: usize = w.granted orelse 0;
+        const dd: usize = @intCast(@max(d, 0));
+        return @min(@min(g, dd), w.gain_at.len - 1);
+    }
+
+    /// prepassSelect's objective: expected tokens over the round's ms (the shared table at these rows, else the
+    /// nearest timed width, plus the pass for `members` streams when any join it).
+    fn passRate(r: *const Rule, rows: f64, tokens: f64, members: usize) f64 {
+        const total: i64 = @intFromFloat(@ceil(rows));
+        const last: i64 = @as(i64, @intCast(r.shared_costs.slots.len)) - 1;
+        const streams: i64 = @intCast(r.round_streams);
+        const fwd = if (r.draft_row_ms > 0.0 and streams > 0 and total >= streams)
+            (r.shared_costs.get(@min(streams, last)) orelse return 0.0) + r.draft_row_ms * @as(f64, @floatFromInt(total - streams))
+        else
+            r.shared_costs.get(@min(total, last)) orelse return 0.0;
+        const pass = if (members == 0) 0.0 else r.pass_ms[0] + r.pass_ms[1] * @as(f64, @floatFromInt(members));
+        return tokens / (fwd + pass);
+    }
+
     /// One draft after `wait` plain rounds in a row; each probe doubles the wait until drafting wins again.
     fn probePlain(r: *Rule, st: *State) bool {
         st.plain = (st.plain orelse 0) + 1;
@@ -194,6 +311,7 @@ pub const Rule = struct {
                 const granted: i64 = if (w.granted) |g| g else r.most_drafts;
                 o.* = try r.headDepth(w, @min(inner, granted + r.k.draft_slack), probe);
             }
+            try r.prepassSelect(whos, out);
             return;
         }
         const most = try r.gpa.alloc(i64, whos.len);
@@ -239,7 +357,10 @@ pub const Rule = struct {
     }
 
     pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64) !void {
-        const forward = r.shared_costs.get(@intCast(rows)) orelse return;
+        const forward = if (r.draft_row_ms > 0.0 and rows >= streams)
+            (r.shared_costs.get(@intCast(streams)) orelse return) + r.draft_row_ms * @as(f64, @floatFromInt(rows - streams))
+        else
+            r.shared_costs.get(@intCast(rows)) orelse return;
         const extra = if (ms - forward > 0.0) ms - forward else 0.0;
         for (r.overhead.items) |*o| {
             if (o.streams == streams) {

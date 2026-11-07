@@ -55,6 +55,20 @@ pub const Kernel = struct {
         self.* = undefined;
     }
 
+    /// TF_DS_TRITON_PDL_ATTR=0: the captured kernels' launches without the PDL attribute (the decode plan's G0.2 control
+    /// (c), "consumer launch attribute off"): the same PDL=1 cubins, which still execute griddepcontrol (an ordinary
+    /// producer's launch_dependents still releases a consumer that keeps the attribute). Unset or any other value: as
+    /// the kit recorded.
+    pub fn pdlAttribute() bool {
+        const S = struct {
+            var v: ?bool = null;
+        };
+        if (S.v) |v| return v;
+        const v = if (std.c.getenv("TF_DS_TRITON_PDL_ATTR")) |e| !std.mem.eql(u8, std.mem.span(e), "0") else true;
+        S.v = v;
+        return v;
+    }
+
     /// The launch geometry Triton uses for a grid: x times num_ctas, 32 * num_warps threads, metadata shared bytes.
     pub fn config(self: Kernel, grid: launch.Dim3) launch.Config {
         const m = self.meta;
@@ -64,7 +78,7 @@ pub const Kernel = struct {
             .shared = m.shared,
             .cluster = if (m.num_ctas != 1) .{ .x = m.num_ctas } else null,
             .cluster_spread = m.num_ctas != 1,
-            .pdl = m.launch_pdl,
+            .pdl = m.launch_pdl and pdlAttribute(),
             .cooperative = m.launch_cooperative_grid,
         };
     }

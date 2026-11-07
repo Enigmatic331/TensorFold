@@ -3,6 +3,7 @@ const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
+const video = @import("video.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
@@ -26,6 +27,8 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
 pub const Images = struct {
     placeholder: []const u8,
     list: std.ArrayList([]const u8) = .empty,
+    /// The server's io, for video parts (video.zig decodes them into frames); without it a video part is refused.
+    io: ?std.Io = null,
 };
 
 pub const image_text_refusal = "image input: message text must not contain the image placeholder token";
@@ -36,7 +39,7 @@ const text_only_refusal = "this server accepts text parts only; image, audio and
 fn isImagePart(part: Value) bool {
     if (part != .object) return false;
     const t = part.get("type") orelse return false;
-    return t == .string and std.mem.eql(u8, t.string, "image_url");
+    return t == .string and (std.mem.eql(u8, t.string, "image_url") or std.mem.eql(u8, t.string, video.frame_type));
 }
 
 /// Whether any message's content list holds an image part.
@@ -53,6 +56,7 @@ fn hasImages(list: Value) bool {
 /// An ``image_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL, the base64 as
 /// Python's b64decode reads it; the served lane's refusals otherwise.
 fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
+    if (part.get(video.frame_bytes)) |b| if (b == .string) return b.string;
     const url: []const u8 = blk: {
         const r = part.get("image_url") orelse break :blk "";
         if (r == .string) break :blk r.string;
@@ -73,12 +77,12 @@ fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
     };
 }
 
-const B64 = union(enum) { ok: []u8, short: usize, padding, oom };
+pub const B64 = union(enum) { ok: []u8, short: usize, padding, oom };
 
 /// binascii.a2b_base64 as base64.b64decode calls it (not strict): characters outside the alphabet skipped, the input
 /// read until a complete padding, an incomplete last quad an error (one character over: "short", with the data
 /// characters it counts; two or three: "padding").
-fn b64decode(a: std.mem.Allocator, s: []const u8) B64 {
+pub fn b64decode(a: std.mem.Allocator, s: []const u8) B64 {
     const out = a.alloc(u8, s.len / 4 * 3 + 3) catch return .oom;
     var n: usize = 0;
     var quad: u8 = 0;
@@ -152,8 +156,10 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
 /// renders it (the reference's process_image_messages): every message's content list joined with blank lines, each
 /// image part its placeholder (its bytes into `images`), no message text holding the placeholder.
 pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, images: ?*Images) errors.Refused!Value {
-    const list = messages orelse return cx.refuse("messages must be a non-empty list");
-    if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
+    const given = messages orelse return cx.refuse("messages must be a non-empty list");
+    if (given != .array or given.array.len == 0) return cx.refuse("messages must be a non-empty list");
+    // video parts become their frames (each a timestamp text part and a picture) before the image path reads them
+    const list = if (images) |im| if (im.io) |io| try video.expand(cx, io, given) else given else given;
     const with_images = images != null and hasImages(list);
     var out: std.ArrayList(Value) = .empty;
     var instructions: std.ArrayList(*json.Object) = .empty;

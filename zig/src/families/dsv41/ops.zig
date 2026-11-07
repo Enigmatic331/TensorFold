@@ -40,6 +40,7 @@ pub const Ops = struct {
     gather: cuda.Function,
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
+    top_cand_rows: cuda.Function,
     gpu_clock: cuda.Function,
     rest_group: cuda.Function,
     remap_picks: cuda.Function,
@@ -74,6 +75,7 @@ pub const Ops = struct {
             .gather = try mv.function("tf_gather_rows_kernel"),
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
+            .top_cand_rows = try fm.function("tf_ds_top_cand_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
             .rest_group = try fm.function("tf_ds_rest_group_kernel"),
             .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
@@ -300,6 +302,22 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// Track B: each row's first `count` (value, id) in sampling.topCandidates' order into vals [rows, count] fp32 and ids
+    /// [rows, count] i64; flags [rows] i32 (0, or a row the host must read whole: 1 a NaN, 2 too many ties at the cut).
+    pub fn topCandRows(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, count: usize, vals: u64, ids: u64, flags: u64) !void {
+        if (rows == 0 or n == 0) return;
+        if (count == 0 or count > 64) return error.TooManyCandidates;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(u64, ld));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(count)));
+        a.add(vals);
+        a.add(ids);
+        a.add(flags);
+        try go(o.top_cand_rows, s, rows, 1024, &a);
     }
 
     /// A parity split's rest grouping (experts2d _rest_group_kernel): the places of (uids, count, members [maxu, maxm])

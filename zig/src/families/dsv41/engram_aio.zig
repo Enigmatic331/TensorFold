@@ -218,6 +218,87 @@ pub const Aio = struct {
         return id;
     }
 
+    /// The submission of a packed shard's records (`mutex` held): one read a row, ids[i]'s record copied into dsts[i]
+    /// as it completes. Returns the batch id.
+    fn submitRecordsLocked(a: *Aio, pk: engram_io.Packed, ids: []const i64, dsts: []const [*]u8) !u64 {
+        const reads = ids.len;
+        if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+        if (pk.rec + block > slot) return error.RowTooWide;
+        for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) < pk.lo or @as(u64, @intCast(x)) >= pk.hi) return error.RowOutOfRange;
+        const fd = if (pk.fd_d >= 0) pk.fd_d else pk.fd;
+        // the ring's slots [head, head + reads) must be free: reap until no live batch of the last lap holds them
+        while (true) {
+            var busy = false;
+            for (a.live.items) |l| {
+                const b = a.batches.get(l[0]) orelse continue;
+                const lap_lo = a.head -| a.slots;
+                const lap_hi = (a.head + reads) -| a.slots;
+                if (b.left > 0 and l[1] < lap_hi and l[1] + b.n > lap_lo) {
+                    busy = true;
+                    break;
+                }
+            }
+            if (!busy) break;
+            a.reap();
+        }
+        const id = a.next_id;
+        a.next_id += 1;
+        var b: Batch = .{
+            .first = a.head,
+            .n = reads,
+            .left = reads,
+            .dst = try a.gpa.alloc(?[*]u8, reads),
+            .skew = try a.gpa.alloc(usize, reads),
+            .bytes = try a.gpa.alloc(usize, reads),
+        };
+        const cbs = try a.gpa.alloc(Iocb, reads);
+        defer a.gpa.free(cbs);
+        const ptrs = try a.gpa.alloc(*Iocb, reads);
+        defer a.gpa.free(ptrs);
+        for (0..reads) |j| {
+            const row: u64 = @intCast(ids[j]);
+            const off = pk.base + (row - pk.lo) * pk.rec;
+            const lo = std.mem.alignBackward(u64, off, block);
+            b.skew[j] = @intCast(off - lo);
+            b.bytes[j] = pk.rec;
+            b.dst[j] = dsts[j];
+            cbs[j] = .{
+                .data = (id << 20) | j,
+                .lio_opcode = cmd_pread,
+                .fildes = @intCast(fd),
+                .buf = @intFromPtr(a.ring[((a.head + j) % a.slots) * slot ..].ptr),
+                .nbytes = std.mem.alignForward(u64, off + pk.rec - lo, block),
+                .offset = @intCast(lo),
+            };
+            ptrs[j] = &cbs[j];
+        }
+        a.head += reads;
+        try a.batches.put(a.gpa, id, b);
+        try a.live.append(a.gpa, .{ id, b.first });
+        var sent: usize = 0;
+        while (sent < reads) {
+            const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
+            if (r <= 0) {
+                const bp = a.batches.getPtr(id).?;
+                bp.left -= reads - sent; // never submitted
+                bp.failed = true;
+                break;
+            }
+            sent += @intCast(r);
+        }
+        return id;
+    }
+
+    /// Submit the records of `ids` from packed shard `pk`, ids[i]'s landing in dsts[i] (pk.rec bytes) as it completes
+    /// (keep them alive until `wait` returns). Returns the batch id; an empty `ids` returns 0, which `wait` passes.
+    pub fn startRecords(a: *Aio, pk: engram_io.Packed, ids: []const i64, dsts: []const [*]u8) !u64 {
+        if (dsts.len != ids.len) return error.BadSize;
+        if (ids.len == 0) return 0;
+        a.mutex.lockUncancelable(a.io);
+        defer a.mutex.unlock(a.io);
+        return a.submitRecordsLocked(pk, ids, dsts);
+    }
+
     /// Submit rows `ids` of table `t` (weight and scale rows), landing in out_w ([ids.len, row_w]) and out_s as they
     /// complete (keep both alive until `wait` returns). Returns the batch id.
     pub fn start(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !u64 {

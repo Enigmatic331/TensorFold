@@ -422,11 +422,12 @@ pub fn main(init: std.process.Init) !u8 {
         var devices: std.ArrayList([]const u8) = .empty;
         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
         while (dit.next()) |d| try devices.append(a, d);
-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
+        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ 0, 1, 2, 3 }, .{ .max_bytes = 4456448, .gid_index = dsv41.model.Model.rdmaGid() }, &comm, stream);
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
     if (par) |*x| eng.par = x;
+    eng.agree_flag = try arena.take(64); // G0.3: the graph captures' agreement byte (round.Graphs)
     // TP2 with --rdma: the decode gathers over the RDMA ring (the served lane's), their bytes checked as NCCL's were
     var tp2_mod: ?cuda.Module = null;
     defer if (tp2_mod) |*mm| mm.unload();
@@ -864,7 +865,7 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
         if (want_taps) {
             if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| {
-                prompt.tap(eng, ch, j) catch |err| return report(w_out, rank, li, "tap", err);
+                prompt.tap(eng, ch, j, li) catch |err| return report(w_out, rank, li, "tap", err);
             }
         }
         // the fixtures' points of this layer (a checked run only)
@@ -873,14 +874,14 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) return false;
         prompt.attention(eng, ch, caches, shared, li, rings[li], floor, kv_done != null and kv_done.? == li) catch |err| return report(w_out, rank, li, "attention", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) return false;
-        try prompt.gather(eng, ch, ch.pa, ch.ga);
+        try prompt.gather(eng, ch, ch.pa, ch.ga, li);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.?.call, "Comm.gather", null, "out"), ch.ga)) return false;
         prompt.ffnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "ffn mixes", err);
         const mo: ?*const Point = if (checked) (fx.find(att.?.call, "Model.moe", l, "in2") orelse return report(w_out, rank, li, "moe fixture", error.NoLayerFixture)) else null;
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe in", .{li}), mo, ch.x)) return false;
         prompt.moe(eng, ch, li) catch |err| return report(w_out, rank, li, "moe", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.?.call, "Model.moe", l, "out"), ch.pm)) return false;
-        try prompt.gather(eng, ch, ch.pm, ch.gm);
+        try prompt.gather(eng, ch, ch.pm, ch.gm, li + 1);
         if (checked) {
             const mg = fx.find(mo.?.call, "Comm.gather", null, "out") orelse return report(w_out, rank, li, "moe gather fixture", error.NoLayerFixture);
             if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) return false;
