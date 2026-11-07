@@ -117,15 +117,36 @@ pub const Vision = struct {
         }
     }
 
-    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
-    /// rows to the host); its span's tokens.
-    pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
-        if (payload.len < header_bytes) return error.BadImagePayload;
+    fn payloadGrid(payload: []const u8) !picture.Grid {
+        if (payload.len < header_bytes or @intFromPtr(payload.ptr) % @alignOf(u16) != 0) return error.BadImagePayload;
         var x: [6]usize = undefined;
         for (&x, 0..) |*f, i| f.* = std.mem.readInt(u32, payload[i * 4 ..][0..4], .little);
         const g: picture.Grid = .{ .best_h = x[0], .best_w = x[1], .n_vit_h = x[2], .n_vit_w = x[3], .n_llm_h = x[4], .n_llm_w = x[5] };
-        const n = g.patches();
-        if (payload.len != header_bytes + n * vit.patch_in * 2 or g.spanTokens() > max_span) return error.BadImagePayload;
+        const patches = std.math.mul(usize, g.n_vit_h, g.n_vit_w) catch return error.BadImagePayload;
+        const cint_max: usize = @intCast(std.math.maxInt(c_int));
+        if (g.best_h == 0 or g.best_w == 0 or g.n_vit_h == 0 or g.n_vit_w == 0 or g.n_llm_h == 0 or g.n_llm_w == 0 or
+            g.n_vit_h > cint_max or g.n_vit_w > cint_max or g.n_llm_h > cint_max or g.n_llm_w > cint_max or patches > cint_max)
+        {
+            return error.BadImagePayload;
+        }
+        const patch_bytes = std.math.mul(usize, patches, vit.patch_in * 2) catch return error.BadImagePayload;
+        const payload_bytes = std.math.add(usize, header_bytes, patch_bytes) catch return error.BadImagePayload;
+        const row_width = std.math.add(usize, g.n_llm_w, 1) catch return error.BadImagePayload;
+        const row_tokens = std.math.mul(usize, g.n_llm_h, row_width) catch return error.BadImagePayload;
+        const span_tokens = std.math.add(usize, row_tokens, 2) catch return error.BadImagePayload;
+        if (payload.len != payload_bytes or span_tokens > max_span) return error.BadImagePayload;
+        return g;
+    }
+
+    /// Validate a prepared payload and return its text-span width without running the tower.
+    pub fn spanTokens(payload: []const u8) !usize {
+        return (try payloadGrid(payload)).spanTokens();
+    }
+
+    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
+    /// rows to the host); its span's tokens.
+    pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+        const g = try payloadGrid(payload);
         const body: []align(2) const u8 = @alignCast(payload[header_bytes..]);
         const patches = std.mem.bytesAsSlice(u16, body);
         const at = try v.tower.encode(g, patches, null);
@@ -147,4 +168,22 @@ test "a payload's grid reads back" {
     try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, buf[16..20], .little));
     const g: picture.Grid = .{ .best_h = 462, .best_w = 644, .n_vit_h = 33, .n_vit_w = 46, .n_llm_h = 11, .n_llm_w = 16 };
     try std.testing.expectEqual(@as(usize, 189), g.spanTokens());
+}
+
+test "a prepared payload's span validates without the tower" {
+    var payload: [header_bytes + vit.patch_in * 2]u8 align(16) = @splat(0);
+    for ([_]u32{ 14, 14, 1, 1, 1, 1 }, 0..) |x, i| {
+        std.mem.writeInt(u32, payload[i * 4 ..][0..4], x, .little);
+    }
+    try std.testing.expectEqual(@as(usize, 4), try Vision.spanTokens(&payload));
+    try std.testing.expectError(error.BadImagePayload, Vision.spanTokens(payload[0 .. payload.len - 1]));
+    std.mem.writeInt(u32, payload[16..20], max_span, .little);
+    try std.testing.expectError(error.BadImagePayload, Vision.spanTokens(&payload));
+    @memset(payload[0..header_bytes], 0);
+    try std.testing.expectError(error.BadImagePayload, Vision.spanTokens(&payload));
+    try std.testing.expectError(error.BadImagePayload, Vision.spanTokens(payload[1..]));
+    for ([_]u32{ 14, 14, std.math.maxInt(u32), std.math.maxInt(u32), 1, 1 }, 0..) |x, i| {
+        std.mem.writeInt(u32, payload[i * 4 ..][0..4], x, .little);
+    }
+    try std.testing.expectError(error.BadImagePayload, Vision.spanTokens(&payload));
 }

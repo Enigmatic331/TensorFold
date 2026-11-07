@@ -24,6 +24,7 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
+const vision = @import("vision.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -312,6 +313,7 @@ const Fill = struct {
     start: usize,
     replay: usize,
     last_end: usize,
+    image_cut: usize,
     image_next: usize = 0,
     images_ready: bool,
     images_set: bool,
@@ -404,8 +406,8 @@ pub const Lanes = struct {
         self.gpa.free(self.masked);
     }
 
-    /// TF_DS_PREFILL_YIELD=1: the served host advances a prompt a chunk at a time (prefillStep), admitting the queued
-    /// requests and running the live streams' rounds between its chunks. Else the whole prompt in one call, as served.
+    /// TF_DS_PREFILL_YIELD=1: the served host advances a prompt one tower image or text chunk at a time (prefillStep),
+    /// admitting queued requests and running live streams' rounds between steps. Else the whole prompt in one call.
     pub fn backend(self: *Lanes) be.Backend {
         return .{ .ptr = self, .vtable = if (yieldOn()) &vt_stepping else &vt_whole };
     }
@@ -472,6 +474,32 @@ pub const Lanes = struct {
     /// A tower image is a prompt boundary when yielding is enabled; cached and precomputed rows are not.
     fn imageYieldBoundary(tower: bool, enabled: bool) bool {
         return tower and enabled;
+    }
+
+    /// Reject an image before placement, rank frames, snapshot restore or a tower call changes live state.
+    fn validateImage(img: lanes.stream.Image, ids: []const u32, image_id: u32, hidden: usize, has_tower: bool) !void {
+        const at: usize = img.at;
+        const tokens: usize = img.tokens;
+        if (tokens == 0 or at > ids.len or tokens > ids.len - at) return error.BadImageSpan;
+        for (ids[at..][0..tokens]) |id| if (id != image_id) return error.BadImageSpan;
+        if (img.rows) {
+            const row_bytes = std.math.mul(usize, hidden, 2) catch return error.BadImageRows;
+            const expected = std.math.mul(usize, tokens, row_bytes) catch return error.BadImageRows;
+            if (img.bytes.len != expected) return error.BadImageRows;
+        } else {
+            if (!has_tower) return error.NoVisionTower;
+            if (try vision.Vision.spanTokens(img.bytes) != tokens) return error.BadImageSpan;
+        }
+    }
+
+    fn validateImages(images: []const lanes.stream.Image, ids: []const u32, image_id: u32, hidden: usize, has_tower: bool) !void {
+        var previous_end: usize = 0;
+        for (images) |img| {
+            try validateImage(img, ids, image_id, hidden, has_tower);
+            const at: usize = img.at;
+            if (at < previous_end) return error.BadImageSpan;
+            previous_end = at + img.tokens;
+        }
     }
 
     /// TF_DS_DRAFT_ROW_MS=d: A3, the shared rounds' draft rows priced at d ms each apart from the streams' rows (the
@@ -554,7 +582,7 @@ pub const Lanes = struct {
     // -- the vtable ---------------------------------------------------------------------------------------------
 
     /// The whole prompt (TF_DS_PREFILL_YIELD unset, and the standalone path); the served host with it set advances
-    /// prefillStep one chunk at a time instead.
+    /// prefillStep one tower image or text chunk at a time instead.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         while (!try prefillStep(ptr, s)) {
             if (s.between) |b| if (yieldOn() and b.ready(b.ptr)) try b.run(b.ptr);
@@ -590,17 +618,21 @@ pub const Lanes = struct {
     fn startFill(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
         const gpa = self.gpa;
+        const ids = s.prompt();
+        const len = ids.len;
+        if (len == 0) return error.EmptyPrompt;
+        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+        if (size > m.ctx_cap) return error.PromptTooLong;
+        if (s.images.len > 0) {
+            const image_id = m.cfg.image_token orelse return error.NoVision;
+            try validateImages(s.images, ids, image_id, m.cfg.hidden, self.vision != null);
+        }
         m.joinAhead();
         m.fill_seq = &.{};
         if (self.filling_slot) |old| {
             if (self.fills[old]) |*f| f.images_set = false;
         }
         self.filling_slot = null; // a failed setup must not leave another prompt's slot falsely selected
-        const ids = s.prompt();
-        const len = ids.len;
-        if (len == 0) return error.EmptyPrompt;
-        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
-        if (size > m.ctx_cap) return error.PromptTooLong;
         releaseFn(self, s);
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
@@ -647,20 +679,10 @@ pub const Lanes = struct {
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
-        // Image positions are dead in the sequence: no Engram n-gram reaches into or across one. The rows themselves
-        // are produced one tower image per prompt step after the kept state has been restored.
-        var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
-        errdefer spans.deinit(gpa);
-        var rows: std.ArrayList(u8) = .empty;
-        errdefer rows.deinit(gpa);
+        // Mark image positions dead so Engram cannot cross them; tower rows arrive one image per step after restore.
         if (s.images.len > 0) {
-            const image_id = m.cfg.image_token orelse return error.NoVision;
             for (s.images) |img| {
-                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
-                for (seq.items[img.at..][0..img.tokens]) |*q| {
-                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
-                    q.* = -1;
-                }
+                for (seq.items[img.at..][0..img.tokens]) |*q| q.* = -1;
             }
         }
         if (try self.begin(.fill_begin)) {
@@ -670,7 +692,6 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
-        try self.fillImages(spans.items, rows.items);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
@@ -691,10 +712,11 @@ pub const Lanes = struct {
             .start = start,
             .replay = replay,
             .last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows,
+            .image_cut = start,
             .images_ready = s.images.len == 0,
             .images_set = s.images.len == 0,
-            .spans = spans,
-            .rows = rows,
+            .spans = .empty,
+            .rows = .empty,
         };
         self.filling_slot = slot;
     }
@@ -709,19 +731,22 @@ pub const Lanes = struct {
         while (f.image_next < s.images.len) {
             if (s.isCancelled()) return error.Cancelled;
             const img = s.images[f.image_next];
-            f.image_next += 1;
             // A keyed snapshot already contains image rows wholly before its cut.
-            if (@as(usize, img.at) + img.tokens <= s.cached) continue;
+            if (@as(usize, img.at) + img.tokens <= f.image_cut) {
+                f.image_next += 1;
+                continue;
+            }
             const at_row = f.rows.items.len / row_bytes;
             const tower = !img.rows;
             if (img.rows) {
-                if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                 try f.rows.appendSlice(gpa, img.bytes);
             } else {
-                const v = self.vision orelse return error.NoVisionTower;
-                if (try v.rows(img.bytes, gpa, &f.rows) != img.tokens) return error.BadImageSpan;
+                const v = self.vision.?;
+                const got = try v.rows(img.bytes, gpa, &f.rows);
+                std.debug.assert(got == img.tokens);
             }
             try f.spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+            f.image_next += 1;
             if (s.isCancelled()) return error.Cancelled;
             if (imageYieldBoundary(tower, yieldOn())) return false;
         }
@@ -750,21 +775,17 @@ pub const Lanes = struct {
             }
             try m.fillBegin(slot, base);
             const f = &self.fills[slot].?;
-            if (f.images_ready) {
-                try self.fillImages(f.spans.items, f.rows.items);
-                f.images_set = true;
-            }
+            std.debug.assert(f.images_ready);
+            try self.fillImages(f.spans.items, f.rows.items);
+            f.images_set = true;
             self.filling_slot = slot;
         }
         const f = &self.fills[slot].?;
-        if (f.images_ready and !f.images_set) {
-            try self.fillImages(f.spans.items, f.rows.items);
-            f.images_set = true;
-        }
+        std.debug.assert(f.images_ready and f.images_set);
         m.fill_seq = self.seqs[slot].items;
     }
 
-    /// One unchanged 2048-row chunk. Other prompts and decode rounds can run before its next chunk.
+    /// One image boundary or unchanged 2048-row chunk; other prompts and decode rounds can run before its next step.
     fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         const m = self.m;
@@ -1191,17 +1212,21 @@ const idle_commit = "rdma-idle-commit-v1";
 
 fn usesRdma(kind: Kind) bool {
     return switch (kind) {
-        .fill_begin, .fill_chunk, .verify, .pass => true,
+        .fill_chunk, .verify, .pass => true,
         else => false,
     };
 }
 
-fn hasRdma(m: *const Model) bool { return m.ring != null or m.rdma_rings != null; }
+fn hasRdma(m: *const Model) bool {
+    return m.ring != null or m.rdma_rings != null;
+}
 
 fn setRdmaIdle(m: *Model, idle: bool) void {
-    if (m.ring) |r| { if (idle) r.park() else r.wake(); }
+    if (m.ring) |r| {
+        if (idle) r.park() else r.wake();
+    }
     if (m.rdma_rings) |rs| {
-        for ([_]*@import("rdma.zig").Ring{rs.all4, rs.col, rs.pair}) |r| {
+        for ([_]*@import("rdma.zig").Ring{ rs.all4, rs.col, rs.pair }) |r| {
             if (idle) r.park() else r.wake();
         }
     }
@@ -1438,7 +1463,50 @@ test "a frame's fields read back as written" {
 test "only a tower image reaches a yield boundary" {
     try std.testing.expect(!Lanes.imageYieldBoundary(true, false));
     try std.testing.expect(!Lanes.imageYieldBoundary(false, true));
+    try std.testing.expect(!Lanes.imageYieldBoundary(false, false));
     try std.testing.expect(Lanes.imageYieldBoundary(true, true));
+}
+
+test "image request validation rejects malformed spans before fill state" {
+    const ids = [_]u32{ 1, 9, 9, 2 };
+    const good_rows = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    try Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &good_rows, .rows = true }, &ids, 9, 2, false);
+    try std.testing.expectError(
+        error.BadImageRows,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = good_rows[0..7], .rows = true }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.NoVisionTower,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &.{}, .rows = false }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.BadImagePayload,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &.{}, .rows = false }, &ids, 9, 2, true),
+    );
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = 0, .tokens = 2, .bytes = &good_rows, .rows = true }, &ids, 9, 2, false),
+    );
+    const overlapping = [_]lanes.stream.Image{
+        .{ .at = 1, .tokens = 2, .bytes = &good_rows, .rows = true },
+        .{ .at = 2, .tokens = 1, .bytes = good_rows[0..4], .rows = true },
+    };
+    try std.testing.expectError(error.BadImageSpan, Lanes.validateImages(&overlapping, &ids, 9, 2, false));
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = 1, .tokens = 0, .bytes = &.{}, .rows = true }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = std.math.maxInt(u32), .tokens = 1, .bytes = &.{}, .rows = true }, &ids, 9, 2, false),
+    );
+}
+
+test "only RDMA primitives wake parked proxies" {
+    for ([_]Kind{ .fill_begin, .fill_images, .fill_resume, .snap_save, .snap_restore, .snap_drop, .rdma_idle, .done }) |kind| {
+        try std.testing.expect(!usesRdma(kind));
+    }
+    for ([_]Kind{ .fill_chunk, .verify, .pass }) |kind| try std.testing.expect(usesRdma(kind));
 }
 
 test "a round's rows: each window at its positions, its ids written over the rejected rows" {

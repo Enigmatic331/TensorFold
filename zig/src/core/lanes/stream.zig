@@ -83,15 +83,15 @@ pub const Reuse = struct {
     hook: ?MarkHook = null,
 };
 
-/// Called between prompt chunks, the pass standing at `at` (the GPU done with the chunk that ends there).
+/// Called between prompt text chunks, the pass standing at `at` (the GPU done with the chunk that ends there).
 pub const MarkHook = struct {
     ptr: *anyopaque,
     at: *const fn (ptr: *anyopaque, s: *Stream, at: u32) void,
 };
 
-/// Called between prompt chunks after the chunk's mark hook, the GPU's queue holding the chunk (the decode plan's Track
-/// D, resumable prefill): the host's turn to run a round of the streams already decoding, so one prompt's pass stops
-/// nobody's decode for its whole length. An error ends this prompt's pass.
+/// Called between prompt image or text steps after a text chunk's mark hook, the GPU queue holding the completed step
+/// (the decode plan's Track D, resumable prefill): the host runs a round of streams already decoding, so one prompt's
+/// pass stops nobody's decode for its whole length. An error ends this prompt's pass.
 pub const BetweenHook = struct {
     ptr: *anyopaque,
     run: *const fn (ptr: *anyopaque) anyerror!void,
