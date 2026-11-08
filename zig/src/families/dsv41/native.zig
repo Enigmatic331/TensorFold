@@ -28,10 +28,11 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SERVED_K=all|solo                     a stream verifies at most the served lane's choice of drafts (its
 //!                                               round table and draft ms): at any streams, or one stream alone
-//!   TF_FILL_CHUNKS=N                            a prompt pass runs N chunks (of 2,048) at a time, the other streams'
-//!   TF_FILL_ROUNDS, TF_FILL_FIRST               rounds between (TF_FILL_ROUNDS of them, 4 unless set); its first
-//!                                               piece TF_FILL_FIRST chunks (unset: N), so a prompt that short runs
-//!                                               whole. One pass at a time. Unset or 0: each pass whole
+//!   TF_FILL_CHUNKS=N                            a prompt pass runs to one fresh tower-image boundary or N text chunks
+//!                                               (of 2,048) at a time when other work waits, the other streams' rounds
+//!   TF_FILL_ROUNDS, TF_FILL_FIRST               between (TF_FILL_ROUNDS of them, 4 unless set); its first text piece
+//!                                               TF_FILL_FIRST chunks (unset: N), so a prompt that short runs whole.
+//!                                               One pass at a time. Unset or 0: each pass whole
 //!   TF_FILL_MANY=1                              with TF_FILL_CHUNKS: a request is admitted while a pass fills and
 //!                                               its pass runs between the other's pieces (fewest tokens left first)
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance

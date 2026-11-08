@@ -24,6 +24,7 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
+const vision = @import("vision.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -374,11 +375,34 @@ fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void
     std.log.info("dsv41: a prompt of {d} tokens does not resume the kept state of {d} tokens at {d}: {s}; {s}", .{ len, sn.at, sn.base, why.says(), then });
 }
 
-/// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
+/// A prompt pass between its pieces: the image or text step it runs next and what its chunk loop reads.
+const Fill = struct {
+    s: *const lanes.Stream,
+    slot: usize,
+    len: usize,
+    replay: usize,
+    last_end: usize,
+    start: usize,
+    head: bool = false,
+    image_cut: usize,
+    image_next: usize = 0,
+    images_ready: bool,
+    images_set: bool = false,
+    text_started: bool = false,
+};
 
-/// A parked pass's image spans and rows (TF_FILL_MANY): set again when the pass resumes after another one's pieces.
+/// A pass's completed image spans and rows: accumulated between image steps, and set again after TF_FILL_MANY switches.
 const Images = struct { spans: std.ArrayList(@import("prompt.zig").Span) = .empty, rows: std.ArrayList(u8) = .empty };
+
+const ImageRows = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!usize,
+};
+
+fn visionRows(ptr: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+    const v: *vision.Vision = @ptrCast(@alignCast(ptr));
+    return v.rows(payload, gpa, out);
+}
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -424,10 +448,10 @@ pub const Lanes = struct {
     // again (fill_switch). Unset: one pass at a time, as served
     fill_many: bool = false,
     imgs: [max_streams]Images = @splat(.{}),
-    // TF_FILL_CHUNKS: a prompt pass runs this many chunks a step of the lane core's (prefill_step, one pass at a time),
-    // the other streams' rounds between its steps; its first step TF_FILL_FIRST chunks (0: as many), so a prompt that
-    // short runs whole. A step runs on past them while nothing else waits (the stream's share_check). 0: each pass
-    // whole, as served
+    // TF_FILL_CHUNKS: a prompt pass runs to one fresh tower-image boundary or this many text chunks a step of the lane
+    // core's (prefill_step, one pass at a time), the other streams' rounds between its steps; its first text step
+    // TF_FILL_FIRST chunks (0: as many), so a prompt that short runs whole. A step runs on past image and text
+    // boundaries while nothing else waits (the stream's share_check). 0: each pass whole, as served
     fill_chunks: usize = 0,
     fill_first: usize = 0,
     // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (default pass_from_default),
@@ -514,12 +538,47 @@ pub const Lanes = struct {
         return false;
     }
 
+    /// Reject an image before placement, rank frames, snapshot restore or a tower call changes live state.
+    fn validateImage(img: lanes.stream.LaneImage, ids: []const u32, image_id: u32, hidden: usize, has_tower: bool) !void {
+        const at: usize = img.at;
+        const tokens: usize = img.tokens;
+        if (tokens == 0 or at > ids.len or tokens > ids.len - at) return error.BadImageSpan;
+        for (ids[at..][0..tokens]) |id| if (id != image_id) return error.BadImageSpan;
+        if (img.rows) {
+            const row_bytes = std.math.mul(usize, hidden, 2) catch return error.BadImageRows;
+            const expected = std.math.mul(usize, tokens, row_bytes) catch return error.BadImageRows;
+            if (img.bytes.len != expected) return error.BadImageRows;
+        } else {
+            if (!has_tower) return error.NoVisionTower;
+            if (try vision.Vision.spanTokens(img.bytes) != tokens) return error.BadImageSpan;
+        }
+    }
+
+    fn validateImages(images: []const lanes.stream.LaneImage, ids: []const u32, image_id: u32, hidden: usize, has_tower: bool) !void {
+        var previous_end: usize = 0;
+        for (images) |img| {
+            try validateImage(img, ids, image_id, hidden, has_tower);
+            const at: usize = img.at;
+            if (at < previous_end) return error.BadImageSpan;
+            previous_end = at + @as(usize, img.tokens);
+        }
+    }
+
+    fn clearImages(self: *Lanes, slot: usize) void {
+        if (self.fill_many) {
+            self.imgs[slot].spans.clearRetainingCapacity();
+            self.imgs[slot].rows.clearRetainingCapacity();
+        } else {
+            self.imgs[slot].spans.clearAndFree(self.gpa);
+            self.imgs[slot].rows.clearAndFree(self.gpa);
+        }
+    }
+
     /// Slot `slot`'s pass ends (done, failed or released): its parked images go.
     fn dropFill(self: *Lanes, slot: usize) void {
         self.fills[slot] = null;
         if (self.cur == slot) self.cur = null;
-        self.imgs[slot].spans.clearRetainingCapacity();
-        self.imgs[slot].rows.clearRetainingCapacity();
+        self.clearImages(slot);
     }
 
     /// The model's fill state set to `f`'s pass again after another pass's pieces (TF_FILL_MANY), on every rank:
@@ -528,6 +587,11 @@ pub const Lanes = struct {
     fn fillSwitch(self: *Lanes, f: *const Fill) !void {
         const m = self.m;
         const base = (self.streams.get(f.s) orelse return error.UnknownStream).base;
+        std.debug.assert(f.images_ready);
+        if (self.cur) |old| {
+            if (self.fills[old]) |*x| x.images_set = false;
+        }
+        self.cur = null;
         m.joinAhead();
         m.fill_seq = &.{};
         if (try self.begin(.fill_switch)) {
@@ -536,12 +600,25 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(f.slot, base);
-        const im = &self.imgs[f.slot];
+        try self.installImages(f.slot);
+        self.cur = f.slot;
+    }
+
+    /// Install all image rows accumulated for a pass once, after its final fresh image and after every fill switch.
+    fn installImages(self: *Lanes, slot: usize) !void {
+        const f = if (self.fills[slot]) |*x| x else return error.UnknownStream;
+        std.debug.assert(f.images_ready);
+        const im = &self.imgs[slot];
         if (im.spans.items.len > 0) {
             try self.sendImages(im.spans.items, im.rows.items);
-            try m.setImages(im.spans.items, im.rows.items);
+            try self.m.setImages(im.spans.items, im.rows.items);
         }
-        self.cur = f.slot;
+        f.images_set = true;
+        // A single pass never switches away during prefill, so its host copy is dead as soon as the model has it.
+        if (!self.fill_many) {
+            im.spans.clearAndFree(self.gpa);
+            im.rows.clearAndFree(self.gpa);
+        }
     }
 
     /// A pass's image spans and their rows to rank 1, image_piece bytes of rows a frame (a follower's frame buffer
@@ -629,14 +706,19 @@ pub const Lanes = struct {
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
+        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize), false)) return error.FillUnfinished;
     }
 
-    /// One step of the prompt pass (opened at its first): fill_first chunks first, then fill_chunks a step; true once
-    /// it reached the head and drew the first token.
+    /// One step of the prompt pass (opened at its first): one fresh tower image while work waits, otherwise fill_first
+    /// text chunks first and fill_chunks after that; true once it reached the head and drew the first token.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        return self.prefillPart(s, if (self.fillOf(s) == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
+        return self.prefillPart(s, self.stepChunks(s), true);
+    }
+
+    fn stepChunks(self: *Lanes, s: *const lanes.Stream) usize {
+        const first_text = if (self.fillOf(s)) |f| !f.text_started else true;
+        return if (first_text and self.fill_first > 0) self.fill_first else self.fill_chunks;
     }
 
     /// A prompt pass's rows at most when it starts at `start`.
@@ -644,7 +726,7 @@ pub const Lanes = struct {
         return if (start < self.pass_from) model.resume_rows else self.pass_rows;
     }
 
-    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize, stepped: bool) !bool {
         const m = self.m;
         const t0 = m.now();
         defer if (self.prof) |*p| {
@@ -656,7 +738,12 @@ pub const Lanes = struct {
             break :blk self.fillOf(s).?;
         };
         errdefer self.dropFill(f.slot);
-        if (self.cur != f.slot) try self.fillSwitch(f);
+        if (!try self.fillImageStep(s, f, stepped)) return false;
+        if (self.cur != f.slot) {
+            try self.fillSwitch(f);
+        } else if (!f.images_set) {
+            try self.installImages(f.slot);
+        }
         const seq = self.seqs[f.slot].items;
         m.fill_seq = seq;
         // a round may run before the next piece: the read-ahead done and the prompt's ids gone, as rank 1 does at its frame
@@ -670,6 +757,7 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
+            f.text_started = true;
             const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(self.passCap(start), len - start));
             m.next_rows = self.passCap(start + n);
             if (try self.begin(.fill_chunk)) {
@@ -704,6 +792,43 @@ pub const Lanes = struct {
         return true;
     }
 
+    /// Produce image rows through one tower-image boundary. Cached images and precomputed rows do not yield; a lone
+    /// request also runs on, matching the text-chunk scheduler's work-conserving behavior.
+    fn fillImageStep(self: *Lanes, s: *lanes.Stream, f: *Fill, stepped: bool) !bool {
+        const encoder: ?ImageRows = if (self.vision) |v| .{ .ptr = v, .run = visionRows } else null;
+        return self.fillImageStepWith(s, f, stepped, encoder);
+    }
+
+    fn fillImageStepWith(self: *Lanes, s: *lanes.Stream, f: *Fill, stepped: bool, encoder: ?ImageRows) !bool {
+        if (f.images_ready) return true;
+        const gpa = self.gpa;
+        const row_bytes = std.math.mul(usize, self.m.cfg.hidden, 2) catch return error.BadImageRows;
+        const im = &self.imgs[f.slot];
+        while (f.image_next < s.lane_images.len) {
+            if (s.isCancelled()) return error.Cancelled;
+            const img = s.lane_images[f.image_next];
+            if (@as(usize, img.at) + @as(usize, img.tokens) <= f.image_cut) {
+                f.image_next += 1;
+                continue;
+            }
+            const at_row = im.rows.items.len / row_bytes;
+            const tower = !img.rows;
+            if (img.rows) {
+                try im.rows.appendSlice(gpa, img.bytes);
+            } else {
+                const enc = encoder orelse return error.NoVisionTower;
+                const got = try enc.run(enc.ptr, img.bytes, gpa, &im.rows);
+                std.debug.assert(got == img.tokens);
+            }
+            try im.spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+            f.image_next += 1;
+            if (s.isCancelled()) return error.Cancelled;
+            if (tower and stepped and s.shares()) return false;
+        }
+        f.images_ready = true;
+        return true;
+    }
+
     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
     fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
         const m = self.m;
@@ -713,6 +838,10 @@ pub const Lanes = struct {
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.ctx_cap) return error.PromptTooLong;
+        if (s.lane_images.len > 0) {
+            const image_id = m.cfg.image_token orelse return error.NoVision;
+            try validateImages(s.lane_images, ids, image_id, m.cfg.hidden, self.vision != null);
+        }
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
@@ -758,39 +887,23 @@ pub const Lanes = struct {
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
+            if (self.cur == slot) self.cur = null;
+            self.clearImages(slot);
         }
+        self.imgs[slot].spans.clearRetainingCapacity();
+        self.imgs[slot].rows.clearRetainingCapacity();
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
-        // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
-        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start; an image
-        // the kept state holds whole needs no rows (the pass resumes past it)
-        var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
-        defer spans.deinit(gpa);
-        var rows: std.ArrayList(u8) = .empty;
-        defer rows.deinit(gpa);
+        // Image positions are dead in the sequence: no Engram n-gram reaches into or across one. Their rows are
+        // accumulated below one fresh tower image at a time after the kept state has been restored.
         if (s.lane_images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
-            const row_bytes = m.cfg.hidden * 2;
-            const resume_at: usize = if (kept) |sn| sn.at else 0;
-            var at_row: usize = 0;
             for (s.lane_images) |img| {
-                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {
-                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+                    std.debug.assert(q.* == @as(i64, image_id));
                     q.* = -1;
                 }
-                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
-                if (img.rows) {
-                    if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
-                    try rows.appendSlice(gpa, img.bytes);
-                } else {
-                    // a prepared picture (vision.zig): the tower's span rows, here on rank 0
-                    const v = self.vision orelse return error.NoVisionTower;
-                    if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
-                }
-                try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
-                at_row += img.tokens;
             }
         }
         if (try self.begin(.fill_begin)) {
@@ -799,17 +912,12 @@ pub const Lanes = struct {
             try self.wire.ids(gpa, seq.items);
             try self.flush();
         }
+        if (self.cur) |old| {
+            if (self.fills[old]) |*x| x.images_set = false;
+        }
+        self.cur = null;
         try m.fillBegin(slot, base);
         self.cur = slot;
-        if (spans.items.len > 0) {
-            try self.sendImages(spans.items, rows.items);
-            try m.setImages(spans.items, rows.items);
-            if (self.fill_many) { // kept for a switch back to this pass
-                const im = &self.imgs[slot];
-                try im.spans.appendSlice(gpa, spans.items);
-                try im.rows.appendSlice(gpa, rows.items);
-            }
-        }
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
@@ -829,7 +937,16 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last resume point before the replay (the served lane's
         // kept prompt), each at the resume point at or before it
         const last_end = @min(replay, len - 1) / model.resume_rows * model.resume_rows;
-        self.fills[slot] = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
+        self.fills[slot] = .{
+            .s = s,
+            .slot = slot,
+            .len = len,
+            .replay = replay,
+            .last_end = last_end,
+            .start = start,
+            .image_cut = start,
+            .images_ready = s.lane_images.len == 0,
+        };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -1491,16 +1608,185 @@ test "TF_FILL_CHUNKS steps a prompt pass in the lane core, one pass at a time; u
     try std.testing.expect(ln.backend().vtable == &Lanes.whole_vt);
 }
 
+test "image request validation rejects malformed spans before fill state" {
+    const ids = [_]u32{ 1, 9, 9, 2 };
+    const good_rows = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    try Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &good_rows, .rows = true }, &ids, 9, 2, false);
+    try std.testing.expectError(
+        error.BadImageRows,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = good_rows[0..7], .rows = true }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.NoVisionTower,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &.{}, .rows = false }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.BadImagePayload,
+        Lanes.validateImage(.{ .at = 1, .tokens = 2, .bytes = &.{}, .rows = false }, &ids, 9, 2, true),
+    );
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = 0, .tokens = 2, .bytes = &good_rows, .rows = true }, &ids, 9, 2, false),
+    );
+    const overlapping = [_]lanes.stream.LaneImage{
+        .{ .at = 1, .tokens = 2, .bytes = &good_rows, .rows = true },
+        .{ .at = 2, .tokens = 1, .bytes = good_rows[0..4], .rows = true },
+    };
+    try std.testing.expectError(error.BadImageSpan, Lanes.validateImages(&overlapping, &ids, 9, 2, false));
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = 1, .tokens = 0, .bytes = &.{}, .rows = true }, &ids, 9, 2, false),
+    );
+    try std.testing.expectError(
+        error.BadImageSpan,
+        Lanes.validateImage(.{ .at = std.math.maxInt(u32), .tokens = 1, .bytes = &.{}, .rows = true }, &ids, 9, 2, false),
+    );
+}
+
+test "image steps yield and resume only after fresh tower images while work waits" {
+    const Flag = struct {
+        fn check(ptr: *anyopaque) bool {
+            const value: *bool = @ptrCast(@alignCast(ptr));
+            return value.*;
+        }
+    };
+    const Encoder = struct {
+        hidden: usize,
+        calls: usize = 0,
+
+        fn rows(ptr: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+            const enc: *@This() = @ptrCast(@alignCast(ptr));
+            const tokens: usize = payload[0];
+            const from = out.items.len;
+            try out.resize(gpa, from + tokens * enc.hidden * 2);
+            @memset(out.items[from..], @intCast(enc.calls + 1));
+            enc.calls += 1;
+            return tokens;
+        }
+    };
+    const tower = [_]lanes.stream.LaneImage{
+        .{ .at = 1, .tokens = 1, .bytes = &.{1} },
+        .{ .at = 3, .tokens = 1, .bytes = &.{1} },
+    };
+    var waits = true;
+    var cancelled = false;
+    var s: lanes.Stream = undefined;
+    s.lane_images = &tower;
+    s.share_check = .{ .ptr = &waits, .check = Flag.check };
+    s.cancel_check = .{ .ptr = &cancelled, .check = Flag.check };
+    var m: Model = undefined;
+    m.cfg.hidden = 2;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer {
+        ln.imgs[0].spans.deinit(std.testing.allocator);
+        ln.imgs[0].rows.deinit(std.testing.allocator);
+    }
+    var f: Fill = .{ .s = &s, .slot = 0, .len = 8, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = false };
+    var enc: Encoder = .{ .hidden = 2 };
+    const hook: ImageRows = .{ .ptr = &enc, .run = Encoder.rows };
+    try std.testing.expect(!try ln.fillImageStepWith(&s, &f, true, hook));
+    try std.testing.expectEqual(@as(usize, 1), f.image_next);
+    try std.testing.expect(!f.images_ready);
+    try std.testing.expect(!try ln.fillImageStepWith(&s, &f, true, hook));
+    try std.testing.expectEqual(@as(usize, 2), f.image_next);
+    try std.testing.expect(!f.images_ready);
+    try std.testing.expect(try ln.fillImageStepWith(&s, &f, true, hook));
+    try std.testing.expect(f.images_ready);
+    try std.testing.expectEqual(@as(usize, 2), enc.calls);
+    try std.testing.expectEqual(@as(usize, 2), ln.imgs[0].spans.items.len);
+    try std.testing.expectEqual(@as(usize, 8), ln.imgs[0].rows.items.len);
+
+    // Cancellation while parked observes the boundary before the next tower call.
+    f.image_next = 1;
+    f.images_ready = false;
+    cancelled = true;
+    try std.testing.expectError(error.Cancelled, ln.fillImageStepWith(&s, &f, true, hook));
+    try std.testing.expectEqual(@as(usize, 2), enc.calls);
+}
+
+test "whole, lone and precomputed image passes run through without a boundary" {
+    const Flag = struct {
+        fn check(ptr: *anyopaque) bool {
+            const value: *bool = @ptrCast(@alignCast(ptr));
+            return value.*;
+        }
+    };
+    const Encoder = struct {
+        calls: usize = 0,
+
+        fn rows(ptr: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+            const enc: *@This() = @ptrCast(@alignCast(ptr));
+            const tokens: usize = payload[0];
+            const from = out.items.len;
+            try out.resize(gpa, from + tokens * 4);
+            @memset(out.items[from..], 0);
+            enc.calls += 1;
+            return tokens;
+        }
+    };
+    const tower = [_]lanes.stream.LaneImage{
+        .{ .at = 1, .tokens = 1, .bytes = &.{1} },
+        .{ .at = 3, .tokens = 1, .bytes = &.{1} },
+    };
+    var waits = true;
+    var s: lanes.Stream = undefined;
+    s.lane_images = &tower;
+    s.share_check = .{ .ptr = &waits, .check = Flag.check };
+    s.cancel_check = null;
+    var m: Model = undefined;
+    m.cfg.hidden = 2;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer {
+        for (ln.imgs[0..3]) |*im| {
+            im.spans.deinit(std.testing.allocator);
+            im.rows.deinit(std.testing.allocator);
+        }
+    }
+    var enc: Encoder = .{};
+    const hook: ImageRows = .{ .ptr = &enc, .run = Encoder.rows };
+    var whole: Fill = .{ .s = &s, .slot = 0, .len = 8, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = false };
+    try std.testing.expect(try ln.fillImageStepWith(&s, &whole, false, hook));
+    try std.testing.expect(whole.images_ready);
+
+    waits = false;
+    var lone: Fill = .{ .s = &s, .slot = 1, .len = 8, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = false };
+    try std.testing.expect(try ln.fillImageStepWith(&s, &lone, true, hook));
+    try std.testing.expect(lone.images_ready);
+
+    const row = [_]u8{ 0, 0, 0, 0 };
+    const ready = [_]lanes.stream.LaneImage{
+        .{ .at = 1, .tokens = 1, .bytes = &row, .rows = true },
+        .{ .at = 3, .tokens = 1, .bytes = &row, .rows = true },
+    };
+    waits = true;
+    s.lane_images = &ready;
+    var precomputed: Fill = .{ .s = &s, .slot = 2, .len = 8, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = false };
+    try std.testing.expect(try ln.fillImageStepWith(&s, &precomputed, true, null));
+    try std.testing.expect(precomputed.images_ready);
+    try std.testing.expectEqual(@as(usize, 4), enc.calls);
+}
+
+test "TF_FILL_FIRST remains the first text step after image boundaries" {
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null, .fill_chunks = 2, .fill_first = 7 };
+    var s: lanes.Stream = undefined;
+    try std.testing.expectEqual(@as(usize, 7), ln.stepChunks(&s));
+    ln.fills[0] = .{ .s = &s, .slot = 0, .len = 10, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = false };
+    try std.testing.expectEqual(@as(usize, 7), ln.stepChunks(&s));
+    ln.fills[0].?.text_started = true;
+    try std.testing.expectEqual(@as(usize, 2), ln.stepChunks(&s));
+}
+
 test "TF_FILL_MANY: each stream's pass is found by its stream, and one ending frees its slot and the model's fill state" {
     var m: Model = undefined;
     var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
     var a: lanes.Stream = undefined;
     var b: lanes.Stream = undefined;
-    ln.fills[2] = .{ .s = &a, .slot = 2, .len = 10, .replay = 0, .last_end = 0, .start = 2048 };
+    ln.fills[2] = .{ .s = &a, .slot = 2, .len = 10, .replay = 0, .last_end = 0, .start = 2048, .image_cut = 0, .images_ready = true };
     ln.cur = 2;
     try std.testing.expect(ln.fillOf(&a).? == &ln.fills[2].?);
     try std.testing.expect(ln.fillOf(&b) == null);
-    ln.fills[5] = .{ .s = &b, .slot = 5, .len = 99000, .replay = 0, .last_end = 0, .start = 0 };
+    ln.fills[5] = .{ .s = &b, .slot = 5, .len = 99000, .replay = 0, .last_end = 0, .start = 0, .image_cut = 0, .images_ready = true };
     try std.testing.expect(ln.fillOf(&b).? == &ln.fills[5].?);
     ln.dropFill(5);
     try std.testing.expect(ln.cur == 2 and ln.fillOf(&b) == null and ln.anyFill());
