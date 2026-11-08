@@ -25,6 +25,7 @@ const mx = @import("mx.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const graph_fault = @import("graph_fault.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -211,7 +212,7 @@ fn pmark(e: *const Engine, m: ProfMark) void {
     if (!dprof) return;
     e.s.synchronize() catch {};
     const t = nowNs();
-    if (m != .start) prof_ns[@intFromEnum(m)] += t - prof_last;
+    if (m != .start) prof_ns[@backingInt(m)] += t - prof_last;
     prof_last = t;
 }
 
@@ -276,6 +277,7 @@ pub const PassGraphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
     captures: u64 = 0, // captures attempted (TF_DS_GRAPH_FAIL_TEST=RANK:N:pass counts them)
+    fault: graph_fault.Fault = .{}, // a failed capture leaves the eager result and backs off new captures
 
     pub const Key = struct { streams: u32, steps: u32 };
 
@@ -297,17 +299,29 @@ pub const PassGraphs = struct {
     fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
         const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
-        // G0.3, as round.Graphs.run: every rank captures and instantiates (the map's room reserved first), then all
-        // agree before any launch; one failure fails the pass on every rank
+        // The eager pass is the request's result. Capture afterward is only an optimization, so a CUDA graph refusal
+        // cannot fail drafting or poison this shape for the rest of the process.
+        try dr.body(e, ch, pool, N, steps, null);
+        if (g.fault.skip()) return;
+        try e.s.synchronize();
+
+        // G0.3, as round.Graphs.run: every rank captures and instantiates, then all agree. One failure keeps the eager
+        // pass on every rank and pauses new captures.
         var failed: ?anyerror = null;
         var exec_got: ?cuda.graph.Exec = null;
         // the map's room first, agreed before anyone records: NCCL needs every rank to capture the same collectives
         // (a rank that skipped the capture would leave the others' recorded exchanges unmatched)
         const room = g.map.ensureUnusedCapacity(g.gpa, 1);
         if (!try e.agreeAll(if (room) |_| true else |_| false)) {
-            try room;
-            return error.GraphCaptureFailed;
+            const pause = g.fault.failed();
+            if (room) |_| {
+                std.log.warn("drafter graph cache could not reserve a new entry on another rank; the eager pass is kept, no new pass-graph captures for {d} misses", .{pause});
+            } else |err| {
+                std.log.warn("drafter graph cache could not reserve a new entry on rank {d} ({s}); the eager pass is kept, no new pass-graph captures for {d} misses", .{ e.comm.rank, @errorName(err), pause });
+            }
+            return;
         }
+        try room;
         capture: {
             cuda.graph.beginCapture(e.s, .thread_local) catch |err| {
                 failed = err;
@@ -343,17 +357,18 @@ pub const PassGraphs = struct {
         };
         if (!all_ok) {
             if (exec_got) |*x| x.deinit();
+            const pause = g.fault.failed();
             if (failed) |err| {
-                std.log.err("drafter pass graph of {d} streams, {d} steps failed on rank {d}: {s}; the pass fails on every rank", .{ N, steps, e.comm.rank, @errorName(err) });
-                return err;
+                std.log.warn("drafter pass graph of {d} streams, {d} steps failed on rank {d}: {s}; the eager result is kept, no new pass-graph captures for {d} misses (failure {d}, {d} in a row)", .{ N, steps, e.comm.rank, @errorName(err), pause, g.fault.total, g.fault.streak });
+                return;
             }
-            std.log.err("drafter pass graph of {d} streams, {d} steps failed on another rank; the pass fails on every rank", .{ N, steps });
-            return error.GraphCaptureFailed;
+            std.log.warn("drafter pass graph of {d} streams, {d} steps failed on another rank; the eager result is kept, no new pass-graph captures for {d} misses (failure {d}, {d} in a row)", .{ N, steps, pause, g.fault.total, g.fault.streak });
+            return;
         }
         const exec = exec_got.?;
-        // The cache owns exec from here, including when the first launch fails.
+        g.fault.succeeded();
+        // The eager pass already produced this call's result. The cache owns the executable for later hits.
         g.map.putAssumeCapacity(key, exec);
-        try exec.launchOn(e.s);
     }
 };
 

@@ -15,4 +15,11 @@ The production-specific work added in this repository is:
 - `245be183036c27a3b64c1dd630453e24e77b5527`: per-image vision yielding, implemented by Codex from the operator's requested design on top of the existing prefill-yield scheduler;
 - `c1592dc1fb97776057e4f68852cadce346596808`: lifecycle, validation and RDMA-wake hardening implemented by Codex after a read-only Claude Code Opus review.
 
+The CUDA-graph failure fallback added after the 2026-11-09 production incident is an adaptation by Codex of
+MiaAI-Lab's eager-result/backoff design from
+[`Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold` release 1.0.0](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/f45f2da3e885131406e1a4085cfa46dd98ca725a).
+MiaAI-Lab authored that design and implementation. This repository ports the behavior to the DSv4.1 four-rank
+backbone-round and drafter graph paths: a miss runs eagerly before capture, a capture failure is agreed across ranks,
+the eager result remains authoritative, and later capture attempts back off from 64 to at most 4096 misses.
+
 No upstream pull request is intended from this flattened production branch.

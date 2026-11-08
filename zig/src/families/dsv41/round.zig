@@ -28,6 +28,7 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
+const graph_fault = @import("graph_fault.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -462,9 +463,9 @@ pub const Round = struct {
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
         if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
             const now = cuda.launch.count;
-            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launches[@backingInt(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
-            try rd.clock(e, @intFromEnum(p));
+            try rd.clock(e, @backingInt(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
@@ -898,7 +899,6 @@ fn linearBytes(l: weights.Linear) [2]u64 {
     };
 }
 
-
 /// A measurement's L2 prefetches left out (TF_DS_L2_SKIP, read at Model.open: bit 1 the "attn" fork after q, 2 the "moe"
 /// fork after wo_b, 4 the "next" fork after the experts); 0 in service.
 pub var l2_skip: u8 = 0;
@@ -988,6 +988,7 @@ pub const Graphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
     captures: u64 = 0, // captures attempted (TF_DS_GRAPH_FAIL_TEST counts them)
+    fault: graph_fault.Fault = .{}, // a failed capture leaves the eager result and backs off new captures
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
@@ -1019,20 +1020,39 @@ pub const Graphs = struct {
             return;
         }
         const start = cy.*;
+        // Run the miss eagerly first. Its bytes are this call's result; graph capture is only an optimization attempted
+        // afterward. This is the Flash Next fallback design adapted to DSv4.1: a refused capture/instantiate can never
+        // turn a correct request into HTTP 500 or leave only some ranks launching a graph.
+        try stretch(e, rd, ch, cs, rings, cy, li, end, null);
+        const eager_end = cy.*;
+        if (g.fault.skip()) return;
+        try e.s.synchronize();
+
         // G0.3 (docs/UNIFIED-DECODE-IMPROVEMENTS.md): a capture or instantiate that fails on one rank only (Hector saw
         // cuGraphInstantiateWithFlags fail with 800 after hours) left that rank out of the stretch's exchanges and the
-        // others waiting in them for good. Every rank now captures and instantiates (the map's room for the new key
-        // reserved first, so nothing can fail after the vote), then all agree on the outcome before any launches: one
-        // failure anywhere fails the stretch, and so the round, on every rank.
+        // others waiting in them for good. Every rank captures and instantiates, then agrees on the outcome. A failure
+        // anywhere now keeps the eager result on every rank and pauses new captures instead of failing the round.
         var failed: ?anyerror = null;
         var exec_got: ?cuda.graph.Exec = null;
         // the map's room first, agreed before anyone records: NCCL needs every rank to capture the same collectives
         // (a rank that skipped the capture would leave the others' recorded exchanges unmatched)
         const room = g.map.ensureUnusedCapacity(g.gpa, 1);
         if (!try e.agreeAll(if (room) |_| true else |_| false)) {
-            try room;
-            return error.GraphCaptureFailed;
+            const pause = g.fault.failed();
+            if (room) |_| {
+                std.log.warn("graph cache could not reserve a new entry on another rank; the eager stretch is kept, no new round-graph captures for {d} misses", .{pause});
+            } else |err| {
+                std.log.warn("graph cache could not reserve a new entry on rank {d} ({s}); the eager stretch is kept, no new round-graph captures for {d} misses", .{ e.comm.rank, @errorName(err), pause });
+            }
+            return;
         }
+        try room;
+        // Capture starts from the same host-side carry as the eager run. Captured work does not execute, so restore
+        // the eager carry after the attempt regardless of how far capture got.
+        cy.* = start;
+        rd.kk = start.kk;
+        rd.has_cand = start.has_cand;
+        rd.has_cblk = start.has_cblk;
         capture: {
             cuda.graph.beginCapture(e.s, .thread_local) catch |err| {
                 failed = err;
@@ -1056,14 +1076,19 @@ pub const Graphs = struct {
                 break :capture;
             };
         }
+        if (failed == null and !std.meta.eql(cy.*, eager_end)) failed = error.GraphStateMismatch;
         g.captures += 1;
         if (failed == null and prompt.injectedCaptureFailure(.round, e.comm.rank, g.captures)) {
             if (exec_got) |*x| x.deinit();
             exec_got = null;
             failed = error.GraphInjectedFailure;
         }
-        // a capture cut short leaves the side and prefetch streams' forks marked outstanding: their work was discarded
-        // with the capture, so the next stretch must not wait on events recorded in it
+        // The capture body's host state is not the call's state: the eager run above is. A capture cut short also leaves
+        // side/prefetch forks marked outstanding even though their recorded work was discarded.
+        cy.* = eager_end;
+        rd.kk = eager_end.kk;
+        rd.has_cand = eager_end.has_cand;
+        rd.has_cblk = eager_end.has_cblk;
         if (failed != null) rd.abortCapture(e);
         const all_ok = e.agreeAll(failed == null) catch |err| {
             if (exec_got) |*x| x.deinit();
@@ -1071,17 +1096,18 @@ pub const Graphs = struct {
         };
         if (!all_ok) {
             if (exec_got) |*x| x.deinit();
+            const pause = g.fault.failed();
             if (failed) |err| {
-                std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on rank {d}: {s}; the round fails on every rank", .{ key.rows, key.bucket, key.stretch, e.comm.rank, @errorName(err) });
-                return err;
+                std.log.warn("graph capture of rows {d} bucket {d} stretch {d} failed on rank {d}: {s}; the eager result is kept, no new round-graph captures for {d} misses (failure {d}, {d} in a row)", .{ key.rows, key.bucket, key.stretch, e.comm.rank, @errorName(err), pause, g.fault.total, g.fault.streak });
+                return;
             }
-            std.log.err("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the round fails on every rank", .{ key.rows, key.bucket, key.stretch });
-            return error.GraphCaptureFailed;
+            std.log.warn("graph capture of rows {d} bucket {d} stretch {d} failed on another rank; the eager result is kept, no new round-graph captures for {d} misses (failure {d}, {d} in a row)", .{ key.rows, key.bucket, key.stretch, pause, g.fault.total, g.fault.streak });
+            return;
         }
         const exec = exec_got.?;
-        // The cache owns exec from here, including when the first launch fails.
-        g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = cy.* });
-        try exec.launchOn(e.s);
+        g.fault.succeeded();
+        // The eager run already produced this call's result. The cache owns the executable for later hits.
+        g.map.putAssumeCapacity(key, .{ .exec = exec, .start = start, .end = eager_end });
     }
 };
 
